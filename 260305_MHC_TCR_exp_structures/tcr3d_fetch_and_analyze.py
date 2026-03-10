@@ -149,8 +149,37 @@ def get_chain_sequences(pdb_file):
 def find_epitope_chains(chain_seqs, epitope):
     return [
         cid for cid, seq in chain_seqs.items()
-        if seq.upper() == epitope.upper()
+        if (seq.upper() in epitope.upper()) or (epitope.upper() in seq.upper())
     ]
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def move_epitope_to_tmp_chain(structure, epitope_chain_id, epitope_seq):
+
+    model = next(structure.get_models())
+    old_chain = model[epitope_chain_id]
+
+    if len(old_chain) < 50:
+        return structure, epitope_chain_id
+    else:
+        tmp_chain = Chain.Chain('tmp')
+        model.add(tmp_chain)
+
+        residues = list(old_chain.get_residues())
+        L = len(epitope_seq)
+
+        for i in range(len(residues) - L + 1):
+            window = residues[i:i+L]
+            seq = "".join(seq1(res.get_resname()) for res in window)
+
+            if seq == epitope_seq:
+                for res in window:
+                    old_chain.detach_child(res.id)
+                    tmp_chain.add(res)
+                break
+
+        return structure, 'tmp'
 # --------------------------------------------------
 
 
@@ -246,6 +275,11 @@ def select_first_complex(structure, chain_seqs, row):
         return {}
     epitope_chain = sorted(epitope_chains)[0]
     
+    # if epitope is same chain as TCR / MHC -> move to tmp
+    structure, epitope_chain = move_epitope_to_tmp_chain(structure, epitope_chain, row.Epitope)
+    if epitope_chain == 'tmp':
+        epitope_chains = ['tmp']
+
     remaining = {cid: seq for cid, seq in chain_seqs.items() if cid != epitope_chain}
 
     # 2. pick TCR alpha/beta chains with most contacts (or smallest distance)
@@ -258,18 +292,18 @@ def select_first_complex(structure, chain_seqs, row):
     # TCR alpha
     if tcr_alpha_counts and max(tcr_alpha_counts.values()) > 0:
         tcr_alpha_chain = max(tcr_alpha_counts, key=tcr_alpha_counts.get)
-    elif tcr_alpha_candidates:
-        alpha_distances = min_ca_distance(structure, epitope_chain, tcr_alpha_candidates)
-        tcr_alpha_chain = min(alpha_distances, key=alpha_distances.get)
+    #elif tcr_alpha_candidates:
+    #    alpha_distances = min_ca_distance(structure, epitope_chain, tcr_alpha_candidates)
+    #    tcr_alpha_chain = min(alpha_distances, key=alpha_distances.get)
     else:
         tcr_alpha_chain = None
 
     # TCR beta
     if tcr_beta_counts and max(tcr_beta_counts.values()) > 0:
         tcr_beta_chain = max(tcr_beta_counts, key=tcr_beta_counts.get)
-    elif tcr_beta_candidates:
-        beta_distances = min_ca_distance(structure, epitope_chain, tcr_beta_candidates)
-        tcr_beta_chain = min(beta_distances, key=beta_distances.get)
+    #elif tcr_beta_candidates:
+    #    beta_distances = min_ca_distance(structure, epitope_chain, tcr_beta_candidates)
+    #    tcr_beta_chain = min(beta_distances, key=beta_distances.get)
     else:
         tcr_beta_chain = None
 
@@ -300,11 +334,11 @@ def select_first_complex(structure, chain_seqs, row):
 
         if len(mhcii_candidates) < 2:
             return {}
-
+        print(epitope_chain)
         mhcii_counts = chains_in_contact_count(
             structure, epitope_chain, mhcii_candidates
         )
-
+        print(mhcii_counts)
         # get the two chains with the highest contact counts
         top_two = sorted(
             mhcii_counts.items(),
@@ -372,6 +406,7 @@ def clean_pdbs(df, indir='pdbs', outdir='pdbs_clean'):
     Keep only specified chains, rename them, and remove water/ions/ligands.
     """
 
+    failed_pdb_ids = []
     for _, row in df.iterrows():
         pdb_file = os.path.join(indir, f'{row.PDB}.pdb')
 
@@ -384,7 +419,8 @@ def clean_pdbs(df, indir='pdbs', outdir='pdbs_clean'):
         # get chain ids for first pMHC:TCR copy 
         structure = PDBParser(QUIET=True).get_structure('structure', pdb_file)
         roles = select_first_complex(structure, chain_seqs, row)
-        print(roles)
+        pdb_id = os.path.basename(pdb_file).split('.')[0]
+        print(pdb_id, roles)
         # chain mappings old chain : new chain
         chain_mapping = {}
         if roles and all(pd.notna(v) for v in roles.values()):
@@ -403,11 +439,13 @@ def clean_pdbs(df, indir='pdbs', outdir='pdbs_clean'):
             if pd.notna(roles["tcr_beta_chain"]):
                 chain_mapping[roles["tcr_beta_chain"]] = 'E'
         else:
-            print('pups')
+            failed_pdb_ids.append(f'{pdb_id} : {roles}')
             continue
         
         # write specified chains to pdb file 
         clean_chains(pdb_file, chain_mapping, out_file=os.path.join(outdir, f'{row.PDB}.pdb'))
+        with open('clean_failed.log', 'w') as f:
+            f.write("\n".join(failed_pdb_ids))
 # --------------------------------------------------
 
 
@@ -451,7 +489,10 @@ def align_pdbs(df, indir, outdir):
 
             # combine them
             moving_atoms = ca_A + ca_B
-
+        
+        if len(moving_atoms) != len(ref_atoms):
+            continue
+            
         # Superimpose
         sup = Superimposer()
         sup.set_atoms(ref_atoms, moving_atoms)
@@ -479,7 +520,7 @@ def main() -> None:
 
     # annotate CDR1 and CDR2 based on V segment
     df = annotate_cdr1_cdr2(df)
-
+    #df = df[df['PDB'].isin(['1AO7', '3O6F', '3T0E', '4P4K', '6DFX', '8VD0'])]
     # download PDBs
     outdir = 'pdbs'
     #download_pdbs(df, outdir)
