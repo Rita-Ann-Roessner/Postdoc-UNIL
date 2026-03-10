@@ -79,6 +79,38 @@ def annotate_cdr1_cdr2(df):
 
 
 # --------------------------------------------------
+def get_stats(df, variables):
+    """
+    Get statistics on experimentally resolved structures.
+    """
+    for var in variables:
+        fig, ax = plt.subplots()
+        
+        # count occurrences
+        counts = df[var].value_counts()
+        wedges, texts, autotexts = ax.pie(counts, labels=counts.index, autopct='%1.1f%%', startangle=90, textprops={'fontsize': 8})
+
+        # rotate labels
+        for i, (text, autotext) in enumerate(zip(texts, autotexts)):
+            if i < len(texts)/2:
+                pass
+            else:
+                text.set_text('')
+                autotext.set_text('')
+
+        # create donut hole
+        centre_circle = plt.Circle((0, 0), 0.70, fc='white')
+        fig.gca().add_artist(centre_circle)
+
+        ax.axis('equal')  # keep circle shape
+        plt.title(f"{var} distribution", fontsize='small', fontweight='bold')
+
+        fig.savefig(f"{var}_donut.pdf", bbox_inches="tight")
+        plt.close(fig)  # prevents memory buildup when looping
+
+
+
+# --------------------------------------------------
 def download_pdbs(df, out_dir="pdbs"):
     """
     Download a PDB structure from RCSB.
@@ -517,10 +549,15 @@ def main() -> None:
     csv_files = glob.glob(os.path.join(pos_arg, '*.csv'))
     df = merge_data(csv_files)
     df = df[df['MHC Name'].str.startswith('HLA-', na=False)] # remove mouse entries (the remaining mouse entries get removed by cdr annotation)
-
+    
     # annotate CDR1 and CDR2 based on V segment
     df = annotate_cdr1_cdr2(df)
-    #df = df[df['PDB'].isin(['1AO7', '3O6F', '3T0E', '4P4K', '6DFX', '8VD0'])]
+    df.to_csv(f'{pos_arg}.csv', index=False)
+
+    # analyze stats
+    variables = ['TRAV', 'TRBV', 'Epitope']
+    get_stats(df, variables)
+
     # download PDBs
     outdir = 'pdbs'
     #download_pdbs(df, outdir)
@@ -536,6 +573,10 @@ def main() -> None:
     outdir = 'pdbs_mhc_align'
     os.makedirs(outdir, exist_ok=True)
     align_pdbs(df, indir, outdir)
+
+    pdbs_aligned = [f.split('.')[0] for f in os.listdir(outdir)]
+    df = df[df['PDB'].isin(pdbs_aligned)]
+    df.to_csv(f'{pos_arg}_structures.csv', index=False)
 
 # --------------------------------------------------
 if __name__ == '__main__':
