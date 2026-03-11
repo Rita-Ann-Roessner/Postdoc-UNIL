@@ -14,6 +14,7 @@ import shutil
 from pathlib import Path
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 from Bio.PDB import PDBList, PDBParser, NeighborSearch, PDBIO, Superimposer
 from Bio.SeqUtils import seq1
@@ -395,13 +396,10 @@ def select_first_complex(structure, chain_seqs, row):
 
 
 # --------------------------------------------------
-def clean_chains(pdb_file, chain_mapping, out_file):
+def clean_chains(structure, chain_mapping, out_file):
     """
     Keep only specified chains, rename them, and remove water/ions/ligands.
     """
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure('structure', pdb_file)
-
     # create new structure
     new_structure = Structure.Structure(structure.id)
     new_model = Model.Model(0)
@@ -475,7 +473,7 @@ def clean_pdbs(df, indir='pdbs', outdir='pdbs_clean'):
             continue
         
         # write specified chains to pdb file 
-        clean_chains(pdb_file, chain_mapping, out_file=os.path.join(outdir, f'{row.PDB}.pdb'))
+        clean_chains(structure, chain_mapping, out_file=os.path.join(outdir, f'{row.PDB}.pdb'))
         with open('clean_failed.log', 'w') as f:
             f.write("\n".join(failed_pdb_ids))
 # --------------------------------------------------
@@ -553,7 +551,7 @@ def main() -> None:
     # annotate CDR1 and CDR2 based on V segment
     df = annotate_cdr1_cdr2(df)
     df.to_csv(f'{pos_arg}.csv', index=False)
-
+#
     # analyze stats
     variables = ['TRAV', 'TRBV', 'Epitope']
     get_stats(df, variables)
