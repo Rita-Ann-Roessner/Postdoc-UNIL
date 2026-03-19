@@ -18,11 +18,8 @@ for (c in 0:1){
 df = read.csv('low_confidence_models.csv')
 out_path = "out/low_confidence"
 
-for (i in c(60,70,80)){
-  tmp = df[df$lowest_conf < i,]
-  file_name_out = paste0(out_path, 'plddt_smaller_than_', i)
-  MixTCRviz(input1=tmp, output.path = out_path, filename.output=file_name_out)
-}
+MixTCRviz(input1=df, output.path = out_path)
+
 
 # outliers by PCA coordinates
 df = read.csv('outlier_models.csv')

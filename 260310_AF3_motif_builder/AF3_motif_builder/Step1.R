@@ -127,8 +127,8 @@ write.csv(df_paired, file.path(topdir, "chainA_B_random_pair.csv"), row.names = 
 # 4. Prepare AF3 input for epitopes with known motifs
 dico <- list(
   "LLWNGPMAV" = "HLA_A0201",
-  "ELAGIGILTV" = "HLA_A0201",
-  "GILGFVFTL" = "HLA_A0201"
+#  "ELAGIGILTV" = "HLA_A0201",
+#  "GILGFVFTL" = "HLA_A0201"
 )
 
 for (peptide in names(dico)) {

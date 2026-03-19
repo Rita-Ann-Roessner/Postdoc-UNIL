@@ -156,3 +156,47 @@ df_expanded <- data.frame(
 df_expanded <- na.omit(df_expanded)
 write.csv(df_expanded, file.path(topdir, 'TRBV_TRBJ_cdr3.csv'), row.names = FALSE)
 
+# 3. Randomly pair A/B chain
+n = 5 # repeat for different A/B pairings
+df_A <- read.csv(file.path(topdir, "TRAV_TRAJ_cdr3.csv"))
+df_A <- df_A[rep(1:nrow(df_A), times = n), ]
+colnames(df_A)[colnames(df_A) == "random_CDR3"] <- "cdr3_TRA"
+
+df_B <- read.csv(file.path(topdir, "TRBV_TRBJ_cdr3.csv"))
+df_B <- df_B[rep(1:nrow(df_B), times = n), ]
+colnames(df_B)[colnames(df_B) == "random_CDR3"] <- "cdr3_TRB"
+
+n_A <- nrow(df_A)
+n_B <- nrow(df_B)
+
+n_max <- max(n_A, n_B)
+df_A_expanded <- df_A[sample(1:n_A, n_max, replace = (n_A < n_max)), ]
+df_B_expanded <- df_B[sample(1:n_B, n_max, replace = (n_B < n_max)), ]
+
+# Shuffle both dataframes independently
+df_A_expanded <- df_A_expanded[sample(1:n_max), ]
+df_B_expanded <- df_B_expanded[sample(1:n_max), ]
+
+rownames(df_A_expanded) <- NULL
+rownames(df_B_expanded) <- NULL
+
+df_paired <- cbind(df_A_expanded, df_B_expanded)
+
+write.csv(df_paired, file.path(topdir, "chainA_B_random_pair.csv"), row.names = FALSE)
+
+# 4. Prepare AF3 input for epitopes with known motifs
+dico <- list(
+  "LLWNGPMAV" = "HLA_A0201"
+)
+
+for (peptide in names(dico)) {
+  MHC <- dico[[peptide]]
+  
+  df <- read.csv(file.path(topdir, "chainA_B_random_pair.csv"))
+  
+  df$peptide <- peptide
+  df$MHC <- MHC
+  df$species <- "HomoSapiens"
+  
+  write.csv(df, file.path(topdir, paste0("chainA_B_random_pair_", peptide, ".csv")), row.names = FALSE)
+}
