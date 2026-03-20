@@ -45,11 +45,11 @@ if (Sys.info()["sysname"] == "Linux"){
   # To be able to load installed libraries on the cluster.
   source(paste0("./Struct_preds_fun_mod.R"))
   # File defining some functions used here.
-} else {
-  # Local machine (Mac)
-  source("./Struct_preds_fun_mod.R")
 }
 
+if (Sys.info()["sysname"] == "Darwin") {
+  source("./Struct_preds_fun_mod.R")
+}
 
 library(tidyverse)
 # Load this set of packages that are used in multiple places, allowing also
@@ -57,6 +57,8 @@ library(tidyverse)
 
 # preMSA_folder <- paste0(dataRootFolder, "/TCR/Struct_preds/preMSA/",
 #   "AF3_models/")
+#preMSA_folder <- paste0("/work/FAC/FBM/LLB/dgfeller/epitope_pred/jracle/preMSA/",
+#  "AF3_models/")
 preMSA_folder <- paste0("/Users/roessner/Documents/PostDoc/Data/TCR_data/preMSA/",
   "AF3_models/")
 # Will add the 'species' subFolder path below after having determined it.
@@ -77,6 +79,9 @@ noPepMSA <- T
 # sequences against which to align the peptide and it shouldn't thus have a big
 # impact on the results (this avoid the need of pre-aligning each peptide that
 # we want to study)).
+
+noTCRMSA <- T
+# Set to T, so that  won't use MSAs for the TCRs, hopefully that will encourage template usage
 
 if (!interactive()){
   args <- commandArgs(trailingOnly=T)
@@ -290,7 +295,7 @@ walk(seq_len(nBatches), .f=function(i){
   }
   if (exportAF3){
     export_AF3_json(tcrTab, nameCol="id", outFolder=paste0(outPath, "/AF3_input"),
-      batchNr=i, outCols=outCols, preMSA_folder=preMSA_folder, noPepMSA=noPepMSA,
+      batchNr=i, outCols=outCols, preMSA_folder=preMSA_folder, noPepMSA=noPepMSA, noTCRMSA=noTCRMSA,
       modelSeeds=modelSeeds)
   }
 })

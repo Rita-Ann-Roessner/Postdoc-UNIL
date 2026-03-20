@@ -275,7 +275,7 @@ export_boltz_yaml <- function(cTab, outCols, nameCol, outFolder, batchNr=NULL){
 }
 
 export_AF3_json <- function(cTab, outCols, nameCol, outFolder, batchNr=NULL,
-  preMSA_folder=NULL, templateFree=F, noPepMSA=F, modelSeeds=1){
+  preMSA_folder=NULL, templateFree=F, noPepMSA=F, noTCRMSA=F, modelSeeds=1){
   if (("MHC_b" %in% outCols) && !"MHC_b" %in% colnames(cTab)){
     warning("MHC_b column absent from the cTab to export for AF3 json.",
       "\n Please make sure this is expected.")
@@ -394,17 +394,21 @@ export_AF3_json <- function(cTab, outCols, nameCol, outFolder, batchNr=NULL,
               } else {
                 stop("cSubCol doesn't seem to match TR.V/J: ", cSubCol)
               }
+              if (noTCRMSA) {
+                pStruct[[1]]$protein$unpairedMsa <- ""
+                pStruct[[1]]$protein$pairedMsa   <- ""
+              } else {
+                if (!is.null(cMSA$unpairedMsa)){
+                  cMSA$unpairedMsa <- gsub(pattern, repl, x=cMSA$unpairedMsa, perl=TRUE)
+                  pStruct[[1]]$protein$unpairedMsa <-
+                    paste0(pStruct[[1]]$protein$unpairedMsa, cMSA$unpairedMsa)
+                }
 
-              if (!is.null(cMSA$unpairedMsa)){
-                cMSA$unpairedMsa <- gsub(pattern, repl, x=cMSA$unpairedMsa, perl=TRUE)
-                pStruct[[1]]$protein$unpairedMsa <-
-                  paste0(pStruct[[1]]$protein$unpairedMsa, cMSA$unpairedMsa)
-              }
-
-              if (!is.null(cMSA$pairedMsa)){
-                cMSA$pairedMsa <- gsub(pattern, repl, x=cMSA$pairedMsa, perl=TRUE)
-                pStruct[[1]]$protein$pairedMsa <-
-                  paste0(pStruct[[1]]$protein$pairedMsa, cMSA$pairedMsa)
+                if (!is.null(cMSA$pairedMsa)){
+                  cMSA$pairedMsa <- gsub(pattern, repl, x=cMSA$pairedMsa, perl=TRUE)
+                  pStruct[[1]]$protein$pairedMsa <-
+                    paste0(pStruct[[1]]$protein$pairedMsa, cMSA$pairedMsa)
+                }
               }
 
               ## NEW: carry over templates too
@@ -423,14 +427,17 @@ export_AF3_json <- function(cTab, outCols, nameCol, outFolder, batchNr=NULL,
             }
           }
 
-          if (!is.null(pStruct[[1]]$protein$unpairedMsa) ||
-              !is.null(pStruct[[1]]$protein$pairedMsa)){
-            qu_str <- paste0(">query\n", tcrSeq, "\n")
-            pStruct[[1]]$protein$unpairedMsa <- paste0(qu_str,
-              pStruct[[1]]$protein$unpairedMsa)
-            pStruct[[1]]$protein$pairedMsa <- paste0(qu_str,
-              pStruct[[1]]$protein$pairedMsa)
-          }
+          if (!noTCRMSA &&
+            (!is.null(pStruct[[1]]$protein$unpairedMsa) ||
+            !is.null(pStruct[[1]]$protein$pairedMsa))) {
+          qu_str <- paste0(">query\n", tcrSeq, "\n")
+          pStruct[[1]]$protein$unpairedMsa <- paste0(
+            qu_str, pStruct[[1]]$protein$unpairedMsa
+          )
+          pStruct[[1]]$protein$pairedMsa <- paste0(
+            qu_str, pStruct[[1]]$protein$pairedMsa
+          )
+        }
         } else {
           cCol_i <- cCol
           if (grepl("^MHC_", cCol)){
