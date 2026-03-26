@@ -568,13 +568,10 @@ plotVJ <- function(count.es, count.rep, plddt.es = NULL, sd.es = NULL, sd.rep = 
   return(count.plot)
 }
 
-# ret.resList when TRUE indicates to return a list of the results instead of the plot directly
-# ret.resList when TRUE indicates to return a list of the results instead of the plot directly
 plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
                    sd.es = NULL, sd.rep = NULL, plot.oneline = 0,
                    ret.resList = FALSE, combined.resList = NULL,
-                   comp.baseline = TRUE, print.size = TRUE, plot.sd = TRUE,
-                   pseudo = 1e-4, show_baseline_ref = TRUE) {
+                   comp.baseline = TRUE, print.size = TRUE, plot.sd = TRUE) {
   
   if (is.null(combined.resList)) {
     
@@ -587,11 +584,11 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
     n.rep <- sum(countL.rep)
     
     for (lc in cn) {
-      if (!is.na(countL.es[lc])) ld.es[lc] <- countL.es[lc]
+      if (!is.na(countL.es[lc]))  ld.es[lc] <- countL.es[lc]
       if (!is.na(countL.rep[lc])) ld.rep[lc] <- countL.rep[lc]
     }
     
-    if (sum(ld.es) > 0) ld.es <- ld.es / sum(ld.es)
+    if (sum(ld.es) > 0)  ld.es <- ld.es / sum(ld.es)
     if (sum(ld.rep) > 0) ld.rep <- ld.rep / sum(ld.rep)
     
     lds.es <- rep(0, length(L.all)); names(lds.es) <- cn
@@ -611,40 +608,22 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
       }
     }
     
-    # normalize input by baseline
-    ld.norm <- (ld.es + pseudo) / (ld.rep + pseudo)
-    
-    # optional approximate propagated SD for the ratio
-    lds.norm <- rep(NA_real_, length(L.all))
-    names(lds.norm) <- cn
-    if (!is.null(sd.es) || !is.null(sd.rep)) {
-      for (lc in cn) {
-        A <- ld.es[lc]
-        B <- ld.rep[lc]
-        sA <- lds.es[lc]
-        sB <- lds.rep[lc]
-        if ((B + pseudo) > 0) {
-          lds.norm[lc] <- sqrt(
-            (sA / (B + pseudo))^2 +
-              (((A + pseudo) * sB) / (B + pseudo)^2)^2
-          )
-        }
-      }
-    }
-    
     ld.df <- data.frame(
-      v1 = L.all,
-      v2 = as.numeric(ld.norm),
-      SD = as.numeric(lds.norm),
-      group = "Input/Baseline"
+      v1 = c(L.all, L.all),
+      v2 = c(ld.es, ld.rep),
+      v3 = c(rep(info["input1.name"], length(L.all)),
+             rep(info["baseline.name"], length(L.all))),
+      SD = c(lds.es, lds.rep)
     )
     
-    # add pLDDT for normalized input points
+    ld.df$v3 <- factor(ld.df$v3, levels = c(info["input1.name"], info["baseline.name"]))
+    
     ld.df$plddt <- NA_real_
     if (!is.null(plddtL.es)) {
-      len_names <- paste0("L_", ld.df$v1)
+      input_idx <- ld.df$v3 == info["input1.name"]
+      len_names <- paste0("L_", ld.df$v1[input_idx])
       match_idx <- match(len_names, names(plddtL.es))
-      ld.df$plddt <- as.numeric(plddtL.es[match_idx])
+      ld.df$plddt[input_idx] <- as.numeric(plddtL.es[match_idx])
     }
     
     if (ret.resList) {
@@ -652,6 +631,7 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
         stop("The 'info' vector given in plotLD input should have 4 elements when ret.resList is TRUE.")
       }
       ld.df$model <- paste0(info["model"], gsub(".*( \\(\\d+\\))", "\\1", info["input1.name"]))
+      levels(ld.df$v3) <- gsub("(.*) \\(\\d+\\)", "\\1", levels(ld.df$v3))
       return(list(ld.df = ld.df, info = info["chain"]))
     }
     
@@ -661,59 +641,61 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
       if (nchar(info["input1.name"]) > 25) legend.size <- 10
     }
     
-    ld.plot <- ggplot(ld.df, aes(x = v1, y = v2))
+    input_name <- info["input1.name"]
+    baseline_name <- info["baseline.name"]
     
-    if (show_baseline_ref) {
-      ld.plot <- ld.plot +
-        geom_hline(yintercept = 1, linetype = "dashed", color = "grey60", linewidth = 0.5)
+    input_df <- ld.df[ld.df$v3 == input_name, , drop = FALSE]
+    baseline_df <- ld.df[ld.df$v3 == baseline_name, , drop = FALSE]
+    
+    point_size <- ifelse(plot.oneline == 0, 2.5, 2)
+    
+    ld.plot <- ggplot()
+    
+    if (plot.sd && (!is.null(sd.es) || !is.null(sd.rep))) {
+      if (nrow(input_df) > 0 && !is.null(sd.es)) {
+        ld.plot <- ld.plot +
+          geom_errorbar(
+            data = input_df,
+            aes(x = v1, ymin = pmax(v2 - SD, 0.001), ymax = v2 + SD),
+            width = 0.3,
+            linewidth = 0.4,
+            color = "grey50"
+          )
+      }
+      if (nrow(baseline_df) > 0 && !is.null(sd.rep)) {
+        ld.plot <- ld.plot +
+          geom_errorbar(
+            data = baseline_df,
+            aes(x = v1, ymin = pmax(v2 - SD, 0.001), ymax = v2 + SD),
+            width = 0.3,
+            linewidth = 0.4,
+            color = "grey50"
+          )
+      }
     }
     
-    if (plot.sd && any(!is.na(ld.df$SD))) {
-      ld.plot <- ld.plot +
-        geom_errorbar(
-          aes(
-            ymax = v2 + SD,
-            ymin = pmax(v2 - SD, 0)
-          ),
-          width = 0.3,
-          linewidth = 0.4,
-          color = "grey60"
-        )
-    }
-    
-  } else {
-    ld.df <- combined.resList$ld.df
-    ld.df$model <- factor(ld.df$model, levels = unique(ld.df$model))
-    info <- combined.resList$info
-    legend.size <- 10
-    
-    ld.plot <- ggplot(ld.df, aes(x = v1, y = v2, color = model)) +
-      facet_grid(rows = vars(model), scales = "free_y") +
-      scale_color_manual(values = set_model_colPals(levels(ld.df$model))) +
-      guides(color = "none")
-    
-    if (show_baseline_ref) {
-      ld.plot <- ld.plot +
-        geom_hline(yintercept = 1, linetype = "dashed", color = "grey60", linewidth = 0.5)
-    }
-  }
-  
-  size <- ifelse(plot.oneline == 0, 2.5, 2)
-  
-  if (is.null(combined.resList)) {
-    
-    # normalized curve in grey
     ld.plot <- ld.plot +
-      geom_line(color = "grey70", linewidth = 0.7)
+      geom_line(
+        data = ld.df,
+        aes(x = v1, y = v2, color = v3, group = v3),
+        linewidth = 0.7
+      ) +
+      geom_point(
+        data = baseline_df,
+        aes(x = v1, y = v2),
+        color = "#56BCC2",
+        shape = 17,
+        size = point_size
+      )
     
-    # points colored by pLDDT if available
     if (!is.null(plddtL.es)) {
       ld.plot <- ld.plot +
         geom_point(
-          aes(fill = plddt),
-          shape = 21,
+          data = input_df,
+          aes(x = v1, y = v2, fill = plddt),
           color = "black",
-          size = size,
+          shape = 21,
+          size = point_size,
           stroke = 0.6
         ) +
         scale_fill_gradient2(
@@ -721,19 +703,48 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
           mid = "white",
           high = "blue",
           midpoint = 0.75,
+          limits = c(0.5, 1.0),
+          oob = scales::squish,
           na.value = "grey85",
           name = "pLDDT",
           guide = "none"
         )
     } else {
       ld.plot <- ld.plot +
-        geom_point(size = size, shape = 16, color = "black")
+        geom_point(
+          data = input_df,
+          aes(x = v1, y = v2),
+          color = "black",
+          shape = 16,
+          size = point_size
+        )
     }
     
-  } else {
     ld.plot <- ld.plot +
-      geom_line(linewidth = 0.7) +
-      geom_point(size = size)
+      scale_color_manual(
+        values = c(
+          setNames("grey70", input_name),
+          setNames("#56BCC2", baseline_name)
+        )
+      ) +
+      guides(
+        color = guide_legend(order = 1, nrow = 1),
+        shape = "none"
+      )
+    
+  } else {
+    
+    ld.df <- combined.resList$ld.df
+    ld.df$model <- factor(ld.df$model, levels = unique(ld.df$model))
+    info <- combined.resList$info
+    legend.size <- 10
+    
+    ld.plot <- ggplot(ld.df, aes(x = v1, y = v2, color = model, linetype = v3)) +
+      facet_grid(rows = vars(model), scales = "free_y") +
+      scale_color_manual(values = set_model_colPals(levels(ld.df$model))) +
+      guides(linetype = guide_legend(nrow = 1, order = 2), color = "none") +
+      geom_point(size = ifelse(plot.oneline == 0, 2.5, 2)) +
+      geom_line()
   }
   
   ld.plot <- ld.plot +
@@ -745,7 +756,7 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
       legend.text = element_text(size = legend.size)
     ) +
     xlab(paste("Length_CDR3", info["chain"], sep = "")) +
-    ylab("Input / Baseline") +
+    ylab("") +
     theme(
       axis.text = element_text(size = 12),
       axis.title = element_text(size = 14),
@@ -853,7 +864,8 @@ plotCDR3 <- function(countL.es, countL.rep, countCDR3.es, countCDR3.rep, plddtCD
                      comp.baseline = TRUE, plot.oneline = 0, plot.all.length = FALSE,
                      logo.type = "bits", plot.cdr3.subtract.baseline = 0,
                      set.cdr3.length = NA, print.size = TRUE){
-  
+ 
+  print(comp.baseline)
   L.es <- as.numeric(lapply(names(countL.es), function(x) unlist(strsplit(x, split = "_"))[2]))
   L.rep <- as.numeric(lapply(names(countL.rep), function(x) unlist(strsplit(x, split = "_"))[2]))
   

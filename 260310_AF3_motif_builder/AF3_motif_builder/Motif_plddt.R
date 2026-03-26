@@ -1,9 +1,8 @@
 library(MixTCRviz)
 library(ggplot2)
 library(dplyr)
+library(ggpubr)
 
-
-### Helper functions ###
 source("plotting_functions.R")
 
 make_info <- function(gene, input_name = "Input", baseline_name = "Baseline", model = "Model_default") {
@@ -12,46 +11,41 @@ make_info <- function(gene, input_name = "Input", baseline_name = "Baseline", mo
   x
 }
 
-# helper to parse a cell that contains a list-like string of numbers
+make_chain_info <- function(chain, input_name = "Input", baseline_name = "Baseline", model = "Model_default") {
+  x <- c(chain, input_name, baseline_name, model)
+  names(x) <- c("chain", "input1.name", "baseline.name", "model")
+  x
+}
+
 parse_num_list <- function(x) {
   if (is.null(x) || is.na(x) || x == "") return(numeric(0))
-  
   x <- gsub("\\[|\\]", "", x)
   vals <- unlist(strsplit(x, "[,[:space:]]+"))
   vals <- vals[nzchar(vals)]
   as.numeric(vals)
 }
 
-# compute per gene plddt
 make_plddt <- function(gene_col, cols) {
   sapply(split(df_plddt, df_plddt[[gene_col]]), function(d) {
     mean(unlist(lapply(cols, function(col) unlist(lapply(d[[col]], parse_num_list)))), na.rm = TRUE)
   })
 }
 
-# Amino-acid alphabet in the same order used by MixTCRviz
 aa.list <- c("A","C","D","E","F","G","H","I","K","L",
              "M","N","P","Q","R","S","T","V","W","Y")
 N.aa <- length(aa.list)
 
-# Build per-length amino-acid/position pLDDT matrices for one chain
-# seq_col: column with CDR3 sequence, e.g. "CDR3A_seq"
-# plddt_col: column with per-residue pLDDT list-string, e.g. "CDR3A"
 make_plddt_cdr3_matrices <- function(df, seq_col, plddt_col, aa_order = aa.list) {
-  
-  # keep only rows with usable sequence + plddt
   keep <- !is.na(df[[seq_col]]) & df[[seq_col]] != "" &
     !is.na(df[[plddt_col]]) & df[[plddt_col]] != ""
   df <- df[keep, , drop = FALSE]
   
   if (nrow(df) == 0) return(list())
   
-  # parse inputs
   seqs <- as.character(df[[seq_col]])
   plddts <- lapply(df[[plddt_col]], parse_num_list)
   lens <- nchar(seqs)
   
-  # keep only rows where sequence length matches number of plddt values
   ok <- mapply(function(s, p) nchar(s) == length(p), seqs, plddts)
   seqs <- seqs[ok]
   plddts <- plddts[ok]
@@ -66,11 +60,8 @@ make_plddt_cdr3_matrices <- function(df, seq_col, plddt_col, aa_order = aa.list)
     seqs_L <- seqs[idx]
     plddts_L <- plddts[idx]
     
-    # sum of pLDDT values for each AA x position
     sum_mat <- matrix(0, nrow = length(aa_order), ncol = L,
                       dimnames = list(aa_order, paste0("pos", seq_len(L))))
-    
-    # number of observations contributing to each AA x position
     n_mat <- matrix(0, nrow = length(aa_order), ncol = L,
                     dimnames = list(aa_order, paste0("pos", seq_len(L))))
     
@@ -97,136 +88,214 @@ make_plddt_cdr3_matrices <- function(df, seq_col, plddt_col, aa_order = aa.list)
   out
 }
 
-
-# compute average pLDDT per CDR3 length from a column like CDR3A or CDR3B
 make_plddt_by_length <- function(col, prefix = "L_") {
   vals_list <- lapply(df_plddt[[col]], parse_num_list)
   
-  # length of each CDR3
   cdr3_len <- sapply(vals_list, length)
-  
-  # mean pLDDT of each CDR3
   cdr3_mean <- sapply(vals_list, function(x) {
     if (length(x) == 0) return(NA_real_)
     mean(x, na.rm = TRUE)
   })
   
-  # keep only non-empty entries
   keep <- cdr3_len > 0 & !is.na(cdr3_mean)
   cdr3_len <- cdr3_len[keep]
   cdr3_mean <- cdr3_mean[keep]
   
-  # average pLDDT by length
-  out <- tapply(cdr3_mean, cdr3_len, mean, na.rm = TRUE)
-  
-  out <- as.numeric(out)
-  names(out) <- paste0(prefix, names(tapply(cdr3_mean, cdr3_len, mean, na.rm = TRUE)))
-  
+  out_raw <- tapply(cdr3_mean, cdr3_len, mean, na.rm = TRUE)
+  out <- as.numeric(out_raw)
+  names(out) <- paste0(prefix, names(out_raw))
   out
 }
 
-### Annotate motif with AF3 pLDDT values ### 
+# ------------------------------------------------------------------------------
+# Helpers for renormalized baseline CDR3 length and motif
+# ------------------------------------------------------------------------------
 
-# 1. Compute stats
+get_baseline_length_for_chain <- function(es, baseline.model, chain_key, info, renormVJ = TRUE) {
+  info_out <- info
+  
+  if (!renormVJ) {
+    return(list(
+      countL.rep = baseline.model$countL[[chain_key]],
+      sd.rep = baseline.model$sdL[[chain_key]],
+      info = info_out
+    ))
+  }
+  
+  has_input_vj <- length(es$countVJ[[chain_key]]) > 0
+  has_baseline_lvj <- !is.null(baseline.model$countL.VJ[[chain_key]])
+  
+  if (has_input_vj && has_baseline_lvj) {
+    info_out["baseline.name"] <- paste(info_out["baseline.name"], "P(VJ)", sep = " | ")
+    bs <- weighted_countL(
+      baseline.model$countL.VJ[[chain_key]],
+      es$countVJ[[chain_key]]
+    )
+  } else {
+    if (!has_input_vj) {
+      message("No P(VJ) information in input1 to compute baseline CDR3 ", chain_key,
+              " length distribution | P(VJ). Using renormVJ = FALSE behavior.")
+    }
+    if (!has_baseline_lvj) {
+      message("No P(L|VJ) information in baseline/input2 to compute baseline CDR3 ", chain_key,
+              " length distribution | P(VJ). Using renormVJ = FALSE behavior.")
+    }
+    bs <- baseline.model$countL[[chain_key]]
+  }
+  
+  list(
+    countL.rep = bs,
+    sd.rep = baseline.model$sdL[[chain_key]],
+    info = info_out
+  )
+}
+
+get_baseline_cdr3_for_chain <- function(es, baseline.model, chain_key, info, renormVJ = TRUE) {
+  info_out <- info
+  
+  if (!renormVJ) {
+    return(list(
+      countCDR3.rep = baseline.model$countCDR3.L[[chain_key]],
+      info = info_out
+    ))
+  }
+  
+  has_input_vj <- max(sapply(es$countVJ.L[[chain_key]], length)) > 0
+  has_baseline_vjl <- !is.null(baseline.model$countCDR3.VJL[[chain_key]])
+  
+  if (has_input_vj && has_baseline_vjl) {
+    info_out["baseline.name"] <- paste(info_out["baseline.name"], "P(VJ)", sep = " | ")
+    bs <- weighted_countCDR3(
+      baseline.model$countCDR3.VJL[[chain_key]],
+      es$countVJ.L[[chain_key]]
+    )
+  } else {
+    if (!has_input_vj) {
+      message("No P(VJ|L) information in input1 to compute baseline CDR3 ", chain_key,
+              " motif | P(VJ). Using renormVJ = FALSE behavior.")
+    }
+    if (!has_baseline_vjl) {
+      message("No P(CDR3|VJL) information in baseline/input2 to compute baseline CDR3 ", chain_key,
+              " motif | P(VJ). Using renormVJ = FALSE behavior.")
+    }
+    bs <- baseline.model$countCDR3.L[[chain_key]]
+  }
+  
+  list(
+    countCDR3.rep = bs,
+    info = info_out
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
+
 topdir <- "../step2_LLWNGPMAV"
 
-df <- read.table(file.path(topdir, "chainA_B_random_pair_LLWNGPMAV_output.txt"), header = TRUE)[, c("id", "AF3_iptm_pair_mean")]
-anno <- read.table(file.path(topdir, "chainA_B_random_pair_LLWNGPMAV_input.txt"), header = TRUE)
+df <- read.table(
+  file.path(topdir, "chainA_B_random_pair_LLWNGPMAV_output.txt"),
+  header = TRUE
+)[, c("id", "AF3_iptm_pair_mean")]
+
+anno <- read.table(
+  file.path(topdir, "chainA_B_random_pair_LLWNGPMAV_input.txt"),
+  header = TRUE
+)
 
 df <- merge(df, anno, by = "id")
 
 baseline <- df
-
 threshold <- 0.8
 model <- df[df$AF3_iptm_pair_mean > threshold, ]
 
-motif <- MixTCRviz(input1=model, input2=baseline) #plot = FALSE
-es <- motif$stat$Model_default
+renormVJ <- TRUE
 
-# 2. Plot motif
+motif <- MixTCRviz(input1 = model, input2 = baseline, renormVJ = renormVJ)
 es <- motif$stat[[1]]
-baseline.stat <- MixTCRviz::build_stat(baseline, chain = "AB", species = es$species, comp.VJL = 0)
+baseline.stat <- MixTCRviz::build_stat(
+  baseline,
+  chain = "AB",
+  species = es$species,
+  comp.VJL = 0
+)
+baseline.model <- MixTCRviz::build_stat(baseline, comp.VJL = renormVJ)
 
-# load plddt csv
-df_plddt = read.csv(file.path(topdir, 'cdr_plddts.csv'))
+df_plddt <- read.csv(file.path(topdir, "cdr_plddts.csv"))
 
-# add plddt to VJ stats
+# ------------------------------------------------------------------------------
+# V/J pLDDT
+# ------------------------------------------------------------------------------
+
 if (is.null(es$plddt)) es$plddt <- list()
+if (is.null(es$plddtV)) es$plddtV <- list()
+if (is.null(es$plddtJ)) es$plddtJ <- list()
+if (is.null(es$plddtL)) es$plddtL <- list()
+if (is.null(es$plddtCDR3.L)) es$plddtCDR3.L <- list()
+
 es$plddtV[["TRA"]] <- make_plddt("TRAV", c("CDR1A", "CDR2A", "CDR3AV"))
 es$plddtV[["TRB"]] <- make_plddt("TRBV", c("CDR1B", "CDR2B", "CDR3BV"))
 es$plddtJ[["TRA"]] <- make_plddt("TRAJ", c("CDR3AJ"))
 es$plddtJ[["TRB"]] <- make_plddt("TRBJ", c("CDR3BJ"))
 
-pVA <- plotVJ(
-  count.es = es$countV[["TRA"]],
-  count.rep = baseline.stat$countV[["TRA"]],
-  plddt.es = es$plddtV[["TRA"]],
-  info = make_info("TRAV"),
-  species = es$species,
-  show.plddt.legend = TRUE
-)
+pVA <- plotVJ(es$countV[["TRA"]], baseline.stat$countV[["TRA"]],
+              plddt.es = es$plddtV[["TRA"]],
+              info = make_info("TRAV"), species = es$species,
+              show.plddt.legend = TRUE)
 
-pVB <- plotVJ(
-  count.es = es$countV[["TRB"]],
-  count.rep = baseline.stat$countV[["TRB"]],
-  plddt.es = es$plddtV[["TRB"]],
-  info = make_info("TRBV"),
-  species = es$species
-)
+pVB <- plotVJ(es$countV[["TRB"]], baseline.stat$countV[["TRB"]],
+              plddt.es = es$plddtV[["TRB"]],
+              info = make_info("TRBV"), species = es$species)
 
-pJA <- plotVJ(
-  count.es = es$countJ[["TRA"]],
-  count.rep = baseline.stat$countJ[["TRA"]],
-  plddt.es = es$plddtJ[["TRA"]],
-  info = make_info("TRAJ"),
-  species = es$species
-)
+pJA <- plotVJ(es$countJ[["TRA"]], baseline.stat$countJ[["TRA"]],
+              plddt.es = es$plddtJ[["TRA"]],
+              info = make_info("TRAJ"), species = es$species)
 
-pJB <- plotVJ(
-  count.es = es$countJ[["TRB"]],
-  count.rep = baseline.stat$countJ[["TRB"]],
-  plddt.es = es$plddtJ[["TRB"]],
-  info = make_info("TRBJ"),
-  species = es$species
-)
+pJB <- plotVJ(es$countJ[["TRB"]], baseline.stat$countJ[["TRB"]],
+              plddt.es = es$plddtJ[["TRB"]],
+              info = make_info("TRBJ"), species = es$species)
 
-# 3. Build the remaining panels for the final motif figure
-#    (length distribution + CDR3 logos)
+# ------------------------------------------------------------------------------
+# Length plots, looped for TRA/TRB
+# ------------------------------------------------------------------------------
 
-infoA <- c(
-  chain = "A",
-  input1.name = "Input",
-  baseline.name = "Baseline",
-  model = "Model_default"
-)
+infoA <- make_chain_info("A")
+infoB <- make_chain_info("B")
 
-infoB <- c(
-  chain = "B",
-  input1.name = "Input",
-  baseline.name = "Baseline",
-  model = "Model_default"
-)
-
-# add plddt to length distribution plots
 es$plddtL[["TRA"]] <- make_plddt_by_length("CDR3A")
-es$plddtL[["TRB"]]  <- make_plddt_by_length("CDR3B")
+es$plddtL[["TRB"]] <- make_plddt_by_length("CDR3B")
 
-# Length-distribution plots
-pLDA <- plotLD(
-  countL.es  = es$countL[["TRA"]],
-  countL.rep = baseline.stat$countL[["TRA"]],
-  plddtL.es = es$plddtL[["TRA"]],
-  info = infoA
+length_plots <- list()
+length_info <- list(
+  TRA = infoA,
+  TRB = infoB
 )
 
-pLDB <- plotLD(
-  countL.es  = es$countL[["TRB"]],
-  countL.rep = baseline.stat$countL[["TRB"]],
-  plddtL.es = es$plddtL[["TRB"]],
-  info = infoB
-)
+for (ch in names(length_info)) {
+  baseline_length <- get_baseline_length_for_chain(
+    es = es,
+    baseline.model = baseline.model,
+    chain_key = ch,
+    info = length_info[[ch]],
+    renormVJ = renormVJ
+  )
+  
+  length_plots[[ch]] <- plotLD(
+    countL.es = es$countL[[ch]],
+    countL.rep = baseline_length$countL.rep,
+    plddtL.es = es$plddtL[[ch]],
+    info = baseline_length$info,
+    sd.rep = baseline_length$sd.rep
+  )
+}
 
-# add plddt to CDR3 logo objects
+pLDA <- length_plots[["TRA"]]
+pLDB <- length_plots[["TRB"]]
+
+# ------------------------------------------------------------------------------
+# CDR3 pLDDT matrices
+# ------------------------------------------------------------------------------
+
 es$plddtCDR3.L[["TRA"]] <- make_plddt_cdr3_matrices(
   df = df_plddt,
   seq_col = "CDR3A_seq",
@@ -239,50 +308,70 @@ es$plddtCDR3.L[["TRB"]] <- make_plddt_cdr3_matrices(
   plddt_col = "CDR3B"
 )
 
-# CDR3 logo objects
-CDR3A <- plotCDR3(
-  countL.es     = es$countL[["TRA"]],
-  countL.rep    = baseline.stat$countL[["TRA"]],
-  countCDR3.es  = es$countCDR3.L[["TRA"]],
-  countCDR3.rep = baseline.stat$countCDR3.L[["TRA"]],
-  plddtCDR3.L.es = es$plddtCDR3.L[["TRA"]],
-  info = infoA
+# ------------------------------------------------------------------------------
+# CDR3 logos, looped for TRA/TRB
+# ------------------------------------------------------------------------------
+
+chain_map <- list(
+  TRA = list(
+    chain_small = "A",
+    seq_col = "CDR3A_seq",
+    plddt_col = "CDR3A",
+    info = infoA
+  ),
+  TRB = list(
+    chain_small = "B",
+    seq_col = "CDR3B_seq",
+    plddt_col = "CDR3B",
+    info = infoB
+  )
 )
 
-CDR3B <- plotCDR3(
-  countL.es     = es$countL[["TRB"]],
-  countL.rep    = baseline.stat$countL[["TRB"]],
-  countCDR3.es  = es$countCDR3.L[["TRB"]],
-  countCDR3.rep = baseline.stat$countCDR3.L[["TRB"]],
-  plddtCDR3.L.es = es$plddtCDR3.L[["TRB"]],
-  info = infoB
-)
+CDR3 <- list()
+cdr3_panels <- list()
 
-# combine input and baseline CDR3 motifs for each chain
+for (ch in names(chain_map)) {
+  info_ch <- chain_map[[ch]]$info
+  
+  baseline_cdr3 <- get_baseline_cdr3_for_chain(
+    es = es,
+    baseline.model = baseline.model,
+    chain_key = ch,
+    info = info_ch,
+    renormVJ = renormVJ
+  )
+  
+  CDR3[[ch]] <- plotCDR3(
+    countL.es = es$countL[[ch]],
+    countL.rep = baseline.stat$countL[[ch]],
+    countCDR3.es = es$countCDR3.L[[ch]],
+    countCDR3.rep = baseline_cdr3$countCDR3.rep,
+    plddtCDR3.L.es = es$plddtCDR3.L[[ch]],
+    info = baseline_cdr3$info
+  )
+  
+  cdr3_panels[[ch]] <- ggpubr::ggarrange(
+    CDR3[[ch]]$ES_max,
+    CDR3[[ch]]$Baseline_max,
+    nrow = 2
+  )
+}
 
-cdr3_panel_A <- ggpubr::ggarrange(
-  CDR3A$ES_max,
-  CDR3A$Baseline_max,
-  nrow = 2
-)
-
-cdr3_panel_B <- ggpubr::ggarrange(
-  CDR3B$ES_max,
-  CDR3B$Baseline_max,
-  nrow = 2
-)
+# ------------------------------------------------------------------------------
+# Final panels
+# ------------------------------------------------------------------------------
 
 pg.all <- list()
 
 pg.all[["TRA"]] <- ggpubr::ggarrange(
   pVA, pJA,
-  pLDA, cdr3_panel_A,
+  pLDA, cdr3_panels[["TRA"]],
   ncol = 2, nrow = 2
 )
 
 pg.all[["TRB"]] <- ggpubr::ggarrange(
   pVB, pJB,
-  pLDB, cdr3_panel_B,
+  pLDB, cdr3_panels[["TRB"]],
   ncol = 2, nrow = 2
 )
 
@@ -295,11 +384,10 @@ fig <- ggpubr::ggarrange(
 grid::grid.newpage()
 grid::grid.draw(fig)
 
-ggplot2::ggsave(
-  "final_motif.png",
+ggsave(
+  file.path(topdir, "final_motif.png"), 
   fig,
   width = 20,
   height = 10,
   dpi = 300
 )
-
