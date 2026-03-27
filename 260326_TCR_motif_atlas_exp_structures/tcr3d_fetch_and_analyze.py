@@ -19,6 +19,10 @@ import matplotlib.pyplot as plt
 from Bio.PDB import PDBList, PDBParser, NeighborSearch, PDBIO, Superimposer
 from Bio.SeqUtils import seq1
 from Bio.PDB import Structure, Model, Chain
+from Bio.Align import PairwiseAligner
+
+import re
+import requests
 
 
 class Args(NamedTuple):
@@ -223,7 +227,7 @@ def longest_common_substring(s1, s2):
 
 
 # --------------------------------------------------
-def find_tcr_chains_by_seq(chain_seqs, seg_seq, min_len=5):
+def find_tcr_chains_by_seq(chain_seqs, seg_seq, min_len=10):
     """ Find TCR chain by identifying overlap with gene segement. """
     hits = []
     
@@ -494,7 +498,7 @@ def clean_pdbs(df, indir='pdbs', outdir='pdbs_clean'):
             print('failed', roles)
             failed_pdb_ids.append(roles)
             continue
-        
+
         # write specified chains to pdb file 
         clean_chains(structure, chain_mapping, out_file=os.path.join(outdir, f'{row.PDB}.pdb'))
     
@@ -561,6 +565,258 @@ def align_pdbs(df, indir, outdir):
 
 
 # --------------------------------------------------
+def best_matching_gene(ref, chain_seq):
+    """ Find gene segment with best overlap between TCR chain sequence and gene segment sequence. """
+    
+    aligner = PairwiseAligner()
+    aligner.mode = "local"
+    
+    # tune these if needed
+    aligner.match_score = 2
+    aligner.mismatch_score = -1
+    aligner.open_gap_score = -2
+    aligner.extend_gap_score = -0.5
+
+    best_name = None
+    best_score = float("-inf")
+    best_full = None
+
+    chain_seq = chain_seq.upper()
+
+    for _, row in ref.iterrows():
+        full_seq = str(row["full"]).upper()
+        score = aligner.score(chain_seq, full_seq)
+
+        if score > best_score:
+            best_score = score
+            best_name = row["Name"]
+            best_full = full_seq
+
+    return best_name
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def annotate_J(df, pdb_dir):
+    """ Infer J segments based on best alignment between TCR chains and reference sequences. """
+    
+    # reference files
+    species = ['HomoSapiens', 'MusMusculus']
+    gene_map = {'TRAJ':'D', 'TRBJ':'E'}
+
+    lst=[]
+    for spec in species:
+        for gene in gene_map:
+            df_gene = pd.read_csv(f'/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/{spec}/{gene}.csv')
+            df_gene = df_gene.rename(columns={df_gene.columns[0]:'Name'})
+            df_gene = df_gene[['Name', 'full']]
+            df_gene['Species'] = spec
+            df_gene['Gene'] = gene
+            lst.append(df_gene)
+    ref = pd.concat(lst)
+
+    lst = []
+    for _, row in df.iterrows():
+        pdb_file = os.path.join(pdb_dir, f'{row.PDB}.pdb')
+
+        if not os.path.exists(pdb_file):
+            continue
+
+        # get sequence for each chain
+        chain_seqs = get_chain_sequences(pdb_file)
+
+        # get TRAJ / TRBV
+        for gene, chain in gene_map.items():
+            tmp = ref[(ref['Species'] == row.Species) & (ref['Gene'] == gene)]
+            chain_seq = chain_seqs[chain]
+
+            best_name = best_matching_gene(tmp, chain_seq)
+            row[gene] = best_name
+        lst.append(row)
+
+    df = pd.DataFrame(lst)
+    return df
+
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def extract_cdr3(sequence, min_len=7, max_len=23):
+    """
+    Extract CDR3 using conserved C (start) and the F/W-GxG motif (end). Ensures min_len <= CDR3 length <= max_len.
+    """
+    # find all conserved C positions
+    c_positions = [m.start() for m in re.finditer("C", sequence)]
+    if not c_positions:
+        return None
+
+    # try Cs from last to first (most likely real CDR3 start)
+    for c_pos in reversed(c_positions):
+        subseq = sequence[c_pos:]
+
+        # find all FGXG / WGXG motifs after this C
+        matches = list(re.finditer(r"([FW])G.G", subseq))
+        if not matches:
+            continue
+
+        # check motifs from LAST to FIRST
+        for match in reversed(matches):
+            end = c_pos + match.start(1) + 1
+            cdr3 = sequence[c_pos:end]
+
+            L = len(cdr3)
+            if min_len <= L <= max_len:
+                return cdr3
+
+    return None
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def annotate_cdr3(df, pdb_dir):
+    cdr_map = {'cdr3_TRA':'D', 'cdr3_TRB':'E'}
+
+    lst = []
+    for _, row in df.iterrows():
+        pdb_file = os.path.join(pdb_dir, f'{row.PDB}.pdb')
+        
+        if not os.path.exists(pdb_file):
+            continue
+
+        # get sequence for each chain
+        chain_seqs = get_chain_sequences(pdb_file)
+        
+        # get TRAJ / TRBV
+        for cdr, chain in cdr_map.items():
+            chain_seq = chain_seqs[chain]
+            row[cdr] = extract_cdr3(chain_seq)
+
+        lst.append(row)
+
+    df = pd.DataFrame(lst)
+    return df
+
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def longest_common_suffix_substring(query, ref):
+    query = str(query).upper()
+    ref = str(ref).upper()
+
+    max_len = 0
+
+    # try all suffixes of query
+    for i in range(len(query)):
+        suffix_q = query[i:]
+
+        # try all suffixes of ref
+        for j in range(len(ref)):
+            suffix_r = ref[j:]
+
+            # compare up to min length
+            k = 0
+            while k < min(len(suffix_q), len(suffix_r)) and suffix_q[k] == suffix_r[k]:
+                k += 1
+
+            if k > max_len:
+                max_len = k
+
+    return max_len
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def best_matching_gene_by_cdr3_suffix(df, cdr3_seq, cdr3_col="CDR3", name_col="Name", min_match=3):
+    """
+    Return the gene name whose reference CDR3 end is the longest exact suffix
+    of the given cdr3_seq.
+    """
+    cdr3_seq = str(cdr3_seq).strip().upper()
+
+    tmp = df[[name_col, cdr3_col]].copy()
+    tmp[cdr3_col] = tmp[cdr3_col].astype(str).str.strip().str.upper()
+
+    tmp["match_len"] = tmp[cdr3_col].apply(
+        lambda x: longest_common_suffix_substring(cdr3_seq, x)
+    )
+
+    # keep only meaningful matches
+    tmp = tmp[tmp["match_len"] >= min_match]
+
+    if tmp.empty:
+        return None
+
+    return tmp.sort_values("match_len", ascending=False).iloc[0][name_col]
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def test(df, pdb_dir):
+    """ Test if based on cdr3 extracted from structure we recover the same V/J segments. """
+
+    # reference files
+    species = ['HomoSapiens', 'MusMusculus']
+    genes = ['TRAJ', 'TRBJ']
+
+    lst=[]
+    for spec in species:
+        for gene in genes:
+            df_gene = pd.read_csv(f'/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/{spec}/{gene}.csv')
+            df_gene = df_gene.rename(columns={df_gene.columns[0]:'Name'})
+            df_gene = df_gene[['Name', 'CDR3']]
+            df_gene['Species'] = spec
+            df_gene['Gene'] = gene
+            lst.append(df_gene)
+    ref = pd.concat(lst)
+
+    chains = ['TRA', 'TRB']
+    lst = []
+
+    lst = []
+    for _, row in df.iterrows():
+
+        for chain in chains:
+            cdr3 = row[f'cdr3_{chain}']
+            # J-segment
+            tmp = ref[(ref['Species'] == row.Species) & (ref['Gene'] == f'{chain}J')]
+            row[f'{chain}J_test'] = best_matching_gene_by_cdr3_suffix(tmp, cdr3)
+        
+        lst.append(row)
+    
+    df = pd.DataFrame(lst)
+    return df
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def annotate_resolution(df):
+
+    lst = []
+    for _, row in df.iterrows():
+        pdb_id = row.PDB.lower()
+        url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+
+        r = requests.get(url)
+        r.raise_for_status()
+        data = r.json()
+
+        res = data.get("rcsb_entry_info", {}).get("resolution_combined", None)
+
+        if res:
+            resolution = res[0]  # usually a list like [2.0]
+        else:
+            resolution = None  # e.g. NMR structures
+
+        row['Resolution'] = np.round(resolution,1)
+        lst.append(row)
+    
+    df = pd.DataFrame(lst)
+    return df
+# --------------------------------------------------
+
+
+# --------------------------------------------------
 def main() -> None:
     """ Make a jazz noise here """
 
@@ -574,7 +830,7 @@ def main() -> None:
     # annotate CDR1 and CDR2 based on V segment; as well as sequence for the V segment
     df = annotate_cdr1_cdr2(df)
     df.to_csv(f'{pos_arg}.csv', index=False)
-
+    """
     # download PDBs
     #outdir = 'pdbs'
     #download_pdbs(df, outdir)
@@ -599,9 +855,24 @@ def main() -> None:
     outdir = 'pdbs_mhc_align'
     os.makedirs(outdir, exist_ok=True)
     align_pdbs(df, indir, outdir)
-
+    """
+    outdir = 'pdbs_mhc_align'
     pdbs_aligned = [f.split('.')[0] for f in os.listdir(outdir)]
     df = df[df['PDB'].isin(pdbs_aligned)]
+
+    # infer J-segment
+    df = df.drop(columns=['CDR1A', 'CDR2A', 'TRAVseq', 'CDR1B', 'CDR2B', 'TRBVseq'])
+    df = annotate_J(df, outdir)
+
+    # annotate CDR3s
+    df = annotate_cdr3(df, outdir)
+    
+    # test
+    df = test(df, outdir)
+    fails = df[(df['TRAJ'] != df['TRAJ_test']) | (df['TRBJ'] != df['TRBJ_test'])]
+
+    df = annotate_resolution(df)
+    df = df.drop(columns=['TRAJ_test', 'TRBJ_test'])
     df.to_csv(f'{pos_arg}_structures.csv', index=False)
 
 # --------------------------------------------------
