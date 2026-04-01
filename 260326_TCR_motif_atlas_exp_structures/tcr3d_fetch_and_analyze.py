@@ -16,13 +16,14 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-from Bio.PDB import PDBList, PDBParser, NeighborSearch, PDBIO, Superimposer
+from Bio.PDB import PDBList, PDBParser, NeighborSearch, PDBIO, Superimposer, Select
 from Bio.SeqUtils import seq1
 from Bio.PDB import Structure, Model, Chain
 from Bio.Align import PairwiseAligner
 
 import re
 import requests
+from difflib import SequenceMatcher
 
 
 class Args(NamedTuple):
@@ -54,15 +55,15 @@ def merge_data(csv_files):
     lst = []
     for file in csv_files:
         df = pd.read_csv(file)[["PDB ID", "Epitope", "MHC Name", "TRAV gene", "TRBV gene"]]
-        df = df.rename(columns={"PDB ID":"PDB", "TRAV gene":"TRAV", "TRBV gene":"TRBV"})
-        df["MHC"] = os.path.basename(file).split('_')[0]
+        df = df.rename(columns={"PDB ID":"PDB", "TRAV gene":"TRAV", "TRBV gene":"TRBV", "Epitope":"Peptide", "MHC Name":"MHC"})
+        df["MHC Class"] = os.path.basename(file).split('_')[0]
         lst.append(df)
 
     df = pd.concat(lst)
     df = df.sort_values(by="PDB")
 
     # annotate species
-    df["Species"] = np.where(df["MHC Name"].str.startswith("HLA", na=False), "HomoSapiens", np.where(df["MHC Name"].str.startswith("H2", na=False), "MusMusculus", pd.NA))
+    df["Species"] = np.where(df["MHC"].str.startswith("HLA", na=False), "HomoSapiens", np.where(df["MHC"].str.startswith("H2", na=False), "MusMusculus", pd.NA))
     df = df.dropna(subset=["Species"])
 
     return df
@@ -508,18 +509,53 @@ def clean_pdbs(df, indir='pdbs', outdir='pdbs_clean'):
 
 
 # --------------------------------------------------
+class OrderedResidueSelect(Select):
+    def __init__(self, structure, mhc_class):
+        self.keep = set()
+        self.mhc_class = mhc_class
+        model = structure[0]
+
+        if mhc_class == 'classI':
+            residues_A = [r for r in model['A'] if r.id[0] == ' ']
+            self.keep.update(residues_A[:180])
+
+        else:
+            residues_A = [r for r in model['A'] if r.id[0] == ' ']
+            residues_B = [r for r in model['B'] if r.id[0] == ' ']
+            self.keep.update(residues_A[:90])
+            self.keep.update(residues_B[:90])
+
+    def accept_residue(self, residue):
+        chain_id = residue.get_parent().id
+
+        if self.mhc_class == 'classI':
+            if chain_id == 'A':
+                return residue in self.keep
+            return True
+
+        else:
+            if chain_id in ['A', 'B']:
+                return residue in self.keep
+            return True
+# --------------------------------------------------
+    
+
+# --------------------------------------------------
 def align_pdbs(df, indir, outdir):
+    parser = PDBParser(QUIET=True)
+    io = PDBIO()
 
     pdbs = glob.glob(f'{indir}/*.pdb')
     pdbs.sort()
 
-    ref_file = pdbs[0]
     # Save reference to output directory
+    ref_file = pdbs[0]
     ref_out_path = os.path.join(outdir, os.path.basename(ref_file))
-    shutil.copy(ref_file, ref_out_path)
-
-    parser = PDBParser(QUIET=True)
-    io = PDBIO()
+    pdb_id = os.path.basename(ref_file).split('.')[0]
+    MHC_class = df.loc[df['PDB'] == pdb_id, 'MHC Class'].values[0]
+    structure = parser.get_structure(os.path.basename(ref_file), ref_file)
+    io.set_structure(structure)
+    io.save(ref_out_path, OrderedResidueSelect(structure, MHC_class))
 
     # Load reference structure (first pdb)
     ref_structure = parser.get_structure("ref", ref_file)
@@ -531,7 +567,7 @@ def align_pdbs(df, indir, outdir):
     for pdb_path in mobile_files:
         # get MHC class
         pdb_id = os.path.basename(pdb_path).split('.')[0]
-        MHC_class = df.loc[df['PDB'] == pdb_id, 'MHC'].values[0]
+        MHC_class = df.loc[df['PDB'] == pdb_id, 'MHC Class'].values[0]
 
         structure = parser.get_structure(os.path.basename(pdb_path), pdb_path)
         if MHC_class == 'classI':
@@ -559,7 +595,7 @@ def align_pdbs(df, indir, outdir):
         # Save aligned PDB
         out_path = os.path.join(outdir, os.path.basename(pdb_path))
         io.set_structure(structure)
-        io.save(out_path)
+        io.save(out_path, OrderedResidueSelect(structure, MHC_class))
         print(f"Aligned {pdb_path} -> {out_path}")
 # --------------------------------------------------
 
@@ -790,6 +826,105 @@ def test(df, pdb_dir):
 
 
 # --------------------------------------------------
+def longest_common_substring_len(a, b):
+    if not isinstance(a, str) or not isinstance(b, str):
+        return 0
+    match = SequenceMatcher(None, a, b, autojunk=False).find_longest_match(0, len(a), 0, len(b))
+    return match.size
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def match_ref_sequence(chain_seq, ref, min_frac=0.45):
+    """
+    Find best matching reference row based on longest shared contiguous block.
+    min_frac is relative to the shorter of the two sequences.
+    """
+    scores = ref['Sequence'].apply(lambda x: longest_common_substring_len(chain_seq, x))
+    ref_tmp = ref.copy()
+    ref_tmp['score'] = scores
+
+    if ref_tmp.empty or ref_tmp['score'].max() == 0:
+        return None
+
+    best = ref_tmp.loc[ref_tmp['score'].idxmax()]
+    
+    shorter_len = min(len(chain_seq), len(best['Sequence']))
+    frac = best['score'] / shorter_len if shorter_len > 0 else 0
+
+    if frac >= min_frac:
+        return best
+    return None
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def clean_mhci_annotation(df, pdb_dir, ref):
+    """ Clean MHC I annotation by comparing sequence with MHC motif atlas entries (ref). """
+
+    lst = []
+    for _, row in df.iterrows():
+        if row['MHC Class'] == 'classI':
+            pdb_file = os.path.join(pdb_dir, f'{row.PDB}.pdb')
+
+            # get sequence for each chain
+            chain_seqs = get_chain_sequences(pdb_file)
+            
+            # get MHCI sequence
+            chain_seq = chain_seqs.get('A')
+
+            best = match_ref_sequence(chain_seq, ref)
+            
+            if best is not None:
+                row['MHC'] = best['Allele']
+            else:
+                row['MHC'] = 'NA'
+        else:
+            pass
+
+        lst.append(row)
+        print('pups', row.PDB)
+
+    df = pd.DataFrame(lst)
+    return df
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+def clean_mhcii_annotation(df, pdb_dir, ref):
+    """Clean MHC II annotation by comparing chain sequence with ref, allowing end overhangs."""
+    chains = ['A', 'B']
+    lst = []
+
+    for _, row in df.iterrows():
+        row = row.copy()
+
+        if row['MHC Class'] == 'classII':
+            pdb_file = os.path.join(pdb_dir, f"{row.PDB}.pdb")
+            chain_seqs = get_chain_sequences(pdb_file)
+
+            mhcii = []
+            for chain in chains:
+                chain_seq = chain_seqs.get(chain)
+
+                best = match_ref_sequence(chain_seq, ref)
+                
+                if best is not None:
+                    mhcii.append(best['Allele'])
+                else:
+                    mhcii.append('NA')
+
+            row['MHC'] = f'{mhcii[0]}-{mhcii[1]}'
+
+        lst.append(row)
+        print('keks', row.PDB)
+
+    df = pd.DataFrame(lst)
+    return df
+# --------------------------------------------------
+
+
+# --------------------------------------------------
 def annotate_resolution(df):
 
     lst = []
@@ -819,7 +954,7 @@ def annotate_resolution(df):
 # --------------------------------------------------
 def main() -> None:
     """ Make a jazz noise here """
-
+    
     args = get_args()
     pos_arg = args.positional
     print(f'input data = "{pos_arg}"')
@@ -855,11 +990,11 @@ def main() -> None:
     outdir = 'pdbs_mhc_align'
     os.makedirs(outdir, exist_ok=True)
     align_pdbs(df, indir, outdir)
-    """
-    outdir = 'pdbs_mhc_align'
+"""  
+    outdir = 'pdbs_mhc_align' # remove !!!
     pdbs_aligned = [f.split('.')[0] for f in os.listdir(outdir)]
     df = df[df['PDB'].isin(pdbs_aligned)]
-
+    #df = df[df['PDB'].isin(['2YPL', '3KXF', '6Q3S'])]
     # infer J-segment
     df = df.drop(columns=['CDR1A', 'CDR2A', 'TRAVseq', 'CDR1B', 'CDR2B', 'TRBVseq'])
     df = annotate_J(df, outdir)
@@ -871,6 +1006,14 @@ def main() -> None:
     df = test(df, outdir)
     fails = df[(df['TRAJ'] != df['TRAJ_test']) | (df['TRBJ'] != df['TRBJ_test'])]
 
+    # clean MHC annotation
+    ref_seqs = pd.read_csv('/Users/roessner/Documents/PostDoc/Data/TCR_data/mhc_alleles/data_classI_MHC_I_sequences_reduced.txt', sep='\t')
+    df = clean_mhci_annotation(df, outdir, ref_seqs)
+    
+    ref_seqs = pd.read_csv('/Users/roessner/Documents/PostDoc/Data/TCR_data/mhc_alleles/data_classII_MHC_II_sequences_reduced.txt', sep='\t')
+    df = clean_mhcii_annotation(df, outdir, ref_seqs)
+
+    # annotate resolution
     df = annotate_resolution(df)
     df = df.drop(columns=['TRAJ_test', 'TRBJ_test'])
     df.to_csv(f'{pos_arg}_structures.csv', index=False)
