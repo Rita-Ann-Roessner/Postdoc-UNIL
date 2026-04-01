@@ -965,7 +965,7 @@ def main() -> None:
     # annotate CDR1 and CDR2 based on V segment; as well as sequence for the V segment
     df = annotate_cdr1_cdr2(df)
     df.to_csv(f'{pos_arg}.csv', index=False)
-    """
+
     # download PDBs
     #outdir = 'pdbs'
     #download_pdbs(df, outdir)
@@ -990,11 +990,10 @@ def main() -> None:
     outdir = 'pdbs_mhc_align'
     os.makedirs(outdir, exist_ok=True)
     align_pdbs(df, indir, outdir)
-"""  
-    outdir = 'pdbs_mhc_align' # remove !!!
+ 
     pdbs_aligned = [f.split('.')[0] for f in os.listdir(outdir)]
     df = df[df['PDB'].isin(pdbs_aligned)]
-    #df = df[df['PDB'].isin(['2YPL', '3KXF', '6Q3S'])]
+
     # infer J-segment
     df = df.drop(columns=['CDR1A', 'CDR2A', 'TRAVseq', 'CDR1B', 'CDR2B', 'TRBVseq'])
     df = annotate_J(df, outdir)
