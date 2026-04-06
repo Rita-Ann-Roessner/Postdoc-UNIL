@@ -322,13 +322,13 @@ def select_first_complex(structure, chain_seqs, row):
     """
     
     # 1. pick epitope with lowest chain ID
-    epitope_chains = find_epitope_chains(chain_seqs, row.Epitope)
+    epitope_chains = find_epitope_chains(chain_seqs, row.Peptide)
     if not epitope_chains:
         return {}
     epitope_chain = sorted(epitope_chains)[0]
     
     # if epitope is same chain as TCR / MHC -> move to tmp
-    structure, epitope_chain = move_epitope_to_tmp_chain(structure, epitope_chain, row.Epitope)
+    structure, epitope_chain = move_epitope_to_tmp_chain(structure, epitope_chain, row.Peptide)
     if epitope_chain == 'tmp':
         epitope_chains = ['tmp']
 
@@ -883,7 +883,6 @@ def clean_mhci_annotation(df, pdb_dir, ref):
             pass
 
         lst.append(row)
-        print('pups', row.PDB)
 
     df = pd.DataFrame(lst)
     return df
@@ -917,7 +916,6 @@ def clean_mhcii_annotation(df, pdb_dir, ref):
             row['MHC'] = f'{mhcii[0]}-{mhcii[1]}'
 
         lst.append(row)
-        print('keks', row.PDB)
 
     df = pd.DataFrame(lst)
     return df
@@ -967,8 +965,8 @@ def main() -> None:
     df.to_csv(f'{pos_arg}.csv', index=False)
 
     # download PDBs
-    #outdir = 'pdbs'
-    #download_pdbs(df, outdir)
+    outdir = 'pdbs'
+    download_pdbs(df, outdir)
 
     # clean PDBs
     indir = 'pdbs'
