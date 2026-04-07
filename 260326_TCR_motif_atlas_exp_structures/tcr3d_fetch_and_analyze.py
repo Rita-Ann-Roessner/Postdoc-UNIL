@@ -1013,6 +1013,12 @@ def main() -> None:
     # annotate resolution
     df = annotate_resolution(df)
     df = df.drop(columns=['TRAJ_test', 'TRBJ_test'])
+
+    # minor fixes for coherency with tcr motif atlas
+    df = df.dropna(subset=['cdr3_TRA'])
+    df['MHC Class'] = df['MHC Class'].replace({'classI':'MHCI', 'classII':'MHCII'})
+    df['Epitope'] = df['MHC'] + '_' + df['Peptide']
+
     df.to_csv(f'{pos_arg}_structures.csv', index=False)
 
 # --------------------------------------------------
