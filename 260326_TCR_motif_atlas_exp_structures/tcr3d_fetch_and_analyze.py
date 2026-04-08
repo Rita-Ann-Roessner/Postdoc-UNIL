@@ -835,7 +835,7 @@ def longest_common_substring_len(a, b):
 
 
 # --------------------------------------------------
-def match_ref_sequence(chain_seq, ref, min_frac=0.45):
+def match_ref_sequence(chain_seq, ref, min_frac=0.5):
     """
     Find best matching reference row based on longest shared contiguous block.
     min_frac is relative to the shorter of the two sequences.
@@ -844,6 +844,8 @@ def match_ref_sequence(chain_seq, ref, min_frac=0.45):
     ref_tmp = ref.copy()
     ref_tmp['score'] = scores
 
+    for i, row in tmp.iterrows():
+        print(row.Allele, row.Sequence)
     if ref_tmp.empty or ref_tmp['score'].max() == 0:
         return None
 
@@ -966,7 +968,7 @@ def main() -> None:
 
     # download PDBs
     outdir = 'pdbs'
-    download_pdbs(df, outdir)
+    #download_pdbs(df, outdir)
 
     # clean PDBs
     indir = 'pdbs'
@@ -981,13 +983,13 @@ def main() -> None:
     exclude_pdbs = ['3D39', '3D3V', '8SHI', '9NIG']
     df = df[~df['PDB'].isin(exclude_pdbs)]
 
-    clean_pdbs(df, indir, outdir)
+    #clean_pdbs(df, indir, outdir)
 
     # align PDBs
     indir = 'pdbs_clean'
     outdir = 'pdbs_mhc_align'
     os.makedirs(outdir, exist_ok=True)
-    align_pdbs(df, indir, outdir)
+    #align_pdbs(df, indir, outdir)
  
     pdbs_aligned = [f.split('.')[0] for f in os.listdir(outdir)]
     df = df[df['PDB'].isin(pdbs_aligned)]
@@ -1015,12 +1017,15 @@ def main() -> None:
     df = df.drop(columns=['TRAJ_test', 'TRBJ_test'])
 
     # minor fixes for coherency with tcr motif atlas
+    df['MHC'] = df['MHC'].str.replace(r'^NA-', '', regex=True) # mhcii DRA is always the same -> remove
+    df = df[~df['MHC'].str.contains('NA', na=False)]
+
     df = df.dropna(subset=['cdr3_TRA'])
     df['MHC Class'] = df['MHC Class'].replace({'classI':'MHCI', 'classII':'MHCII'})
     df['Epitope'] = df['MHC'] + '_' + df['Peptide']
 
     df.to_csv(f'{pos_arg}_structures.csv', index=False)
-
+    print(df)
 # --------------------------------------------------
 if __name__ == '__main__':
     main()
