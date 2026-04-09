@@ -844,8 +844,6 @@ def match_ref_sequence(chain_seq, ref, min_frac=0.5):
     ref_tmp = ref.copy()
     ref_tmp['score'] = scores
 
-    for i, row in tmp.iterrows():
-        print(row.Allele, row.Sequence)
     if ref_tmp.empty or ref_tmp['score'].max() == 0:
         return None
 
