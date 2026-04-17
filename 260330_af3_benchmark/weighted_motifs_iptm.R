@@ -18,7 +18,7 @@ models = unique(df$model)
 print(models)
 df_factors = read.csv('AF3_class_I_factor.csv')
 
-iptm_threshold = 0
+iptm_threshold = 0.8
 out_path = 'motifs/all'
 
 df_filtered <- df[df$AF3_iptm_pair_mean > iptm_threshold , ]
