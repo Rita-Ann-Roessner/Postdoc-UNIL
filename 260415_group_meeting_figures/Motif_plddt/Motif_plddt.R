@@ -12,14 +12,14 @@ source("plotting_functions.R")
 # =============================================================================
 # Config — change these for each new dataset / system
 # =============================================================================
-motif_file            <- "YF_LAU5013_sc_WT_motif.txt"   # pre-filtered model TCRs
+motif_file            <- "B0801_RAKFKQLL_motif.txt"   # pre-filtered model TCRs
 baseline_file         <- NULL                            # baseline TCRs (set to NULL when use_internal_baseline=TRUE)
-plddt_file            <- "YF_cdr_plddts.csv"            # per-residue pLDDT values
+plddt_file            <- "B0801_RAKFKQLL_cdr_plddts.csv"            # per-residue pLDDT values
 renormVJ              <- TRUE
 use_internal_baseline <- TRUE   # TRUE: use MixTCRviz::baseline_HomoSapiens
                                  # FALSE: use baseline_file as baseline
-out_plddt_motif       <- "motif_plddt.png"               # motif with pLDDT coloring
-out_plain_motif       <- "motif_plain.png"               # standard motif
+out_plddt_motif       <- "B0801_RAKFKQLL_motif_plddt.png"               # motif with pLDDT coloring
+out_plain_motif       <- "B0801_RAKFKQLL_motif_plain.png"               # standard motif
 # =============================================================================
 
 # -- Utility functions --------------------------------------------------------

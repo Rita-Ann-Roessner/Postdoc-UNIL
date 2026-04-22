@@ -111,7 +111,8 @@ plotVJ <- function(count.es, count.rep, plddt.es = NULL, sd.es = NULL, sd.rep = 
                    combined.resList = NULL, label.neg = FALSE,
                    ZscoreVJ.thresh = 0, FoldChangeVJ.thresh = 1.25,
                    label.diag = 0.3, label.min.fr = c(0.05, 0.05),
-                   print.size = TRUE, plot.sd = TRUE, verbose = 1, show.plddt.legend = FALSE){
+                   print.size = TRUE, plot.sd = TRUE, verbose = 1, show.plddt.legend = FALSE,
+                   plddt_limits = c(0.5, 1), plddt_midpoint = 0.75, n.input = NULL){
   
   if (is.null(combined.resList)) {
     if (length(count.es) == 0) {
@@ -276,7 +277,8 @@ plotVJ <- function(count.es, count.rep, plddt.es = NULL, sd.es = NULL, sd.rep = 
     }
     
     if(print.size){
-      ylab <- paste(info["input1.name"], " (", n.es, ")", sep = "")
+      n.label <- if (!is.null(n.input)) n.input else n.es
+      ylab <- paste(info["input1.name"], " (", n.label, ")", sep = "")
     } else {
       ylab <- info["input1.name"]
     }
@@ -387,8 +389,8 @@ plotVJ <- function(count.es, count.rep, plddt.es = NULL, sd.es = NULL, sd.rep = 
             low = "red",
             mid = "white",
             high = "blue",
-            midpoint = 0.75,
-            limits = c(0.5, 1),
+            midpoint = plddt_midpoint,
+            limits = plddt_limits,
             oob = scales::squish,
             na.value = "grey85",
             name = "pLDDT",
@@ -417,8 +419,8 @@ plotVJ <- function(count.es, count.rep, plddt.es = NULL, sd.es = NULL, sd.rep = 
             low = "red",
             mid = "white",
             high = "blue",
-            midpoint = 0.75,
-            limits = c(0.5, 1),
+            midpoint = plddt_midpoint,
+            limits = plddt_limits,
             oob = scales::squish,
             na.value = "grey85",
             name = "pLDDT",
@@ -571,7 +573,8 @@ plotVJ <- function(count.es, count.rep, plddt.es = NULL, sd.es = NULL, sd.rep = 
 plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
                    sd.es = NULL, sd.rep = NULL, plot.oneline = 0,
                    ret.resList = FALSE, combined.resList = NULL,
-                   comp.baseline = TRUE, print.size = TRUE, plot.sd = TRUE) {
+                   comp.baseline = TRUE, print.size = TRUE, plot.sd = TRUE,
+                   plddt_limits = c(0.5, 1), plddt_midpoint = 0.75) {
   
   if (is.null(combined.resList)) {
     
@@ -702,8 +705,8 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
           low = "red",
           mid = "white",
           high = "blue",
-          midpoint = 0.75,
-          limits = c(0.5, 1.0),
+          midpoint = plddt_midpoint,
+          limits = plddt_limits,
           oob = scales::squish,
           na.value = "grey85",
           name = "pLDDT",
