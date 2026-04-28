@@ -10,7 +10,7 @@ library(ggpubr)
 # =============================================================================
 # Input
 # =============================================================================
-motif_file <- "../test.txt"
+motif_file <- "../AF3_class_I_cdr3_enrichment.txt"
 
 
 # =============================================================================
@@ -92,6 +92,21 @@ jsd_motif <- function(P, Q) {
   mean(vapply(seq_len(ncol(P)), function(j) jsd_vec(P[, j], Q[, j]), numeric(1)))
 }
 
+# IC-weighted difference scalar (replicates MixTCRviz plot.cdr3.norm=1).
+# IC_p = log2(20) + Σ_aa f(aa)·log2(f(aa))  [= 0 if flat, = log2(20) if spike]
+# diff(aa,p) = IC_p^input · P_p(aa) − IC_p^baseline · Q_p(aa)
+# scalar = Σ_p Σ_aa |diff(aa,p)|
+ic_col <- function(f) {
+  idx <- f > 0
+  log2(20) + sum(f[idx] * log2(f[idx]))
+}
+ic_weighted_mat <- function(P) {
+  apply(P, 2, function(col) ic_col(col) * col)
+}
+ic_diff_motif <- function(P, Q) {
+  sum(abs(ic_weighted_mat(P) - ic_weighted_mat(Q)))
+}
+
 # Most common CDR3 length in the input that is also present in the baseline.
 dominant_length <- function(countL_input, countL_baseline) {
   L_both <- intersect(names(countL_input), names(countL_baseline))
@@ -105,8 +120,7 @@ dominant_length <- function(countL_input, countL_baseline) {
 # =============================================================================
 
 df    <- read.table(motif_file, header = TRUE, sep = "\t")
-motif <- MixTCRviz(input1 = df, plot.cdr3.norm=1)
-print(motif$plot)
+motif <- MixTCRviz(input1 = df, plot=FALSE)
 
 baseline <- MixTCRviz::baseline_HomoSapiens
 
@@ -116,7 +130,8 @@ chains <- c(CDR3A = "TRA", CDR3B = "TRB")
 results <- lapply(models, function(model) {
   es  <- motif$stat[[model]]
   row <- list(model = model)
-  jsd_vals <- c()
+  jsd_vals   <- c()
+  icdif_vals <- c()
 
   for (cdr3_name in names(chains)) {
     chain <- chains[[cdr3_name]]
@@ -155,14 +170,42 @@ results <- lapply(models, function(model) {
       next
     }
 
-    jsd <- jsd_motif(P, Q)
-    row[[paste0("JSD_", cdr3_name)]] <- jsd
-    jsd_vals <- c(jsd_vals, jsd)
+    jsd   <- jsd_motif(P, Q)
+    icdif <- ic_diff_motif(P, Q)
+    row[[paste0("JSD_",    cdr3_name)]] <- jsd
+    row[[paste0("ICdiff_", cdr3_name)]] <- icdif
+    jsd_vals   <- c(jsd_vals,   jsd)
+    icdif_vals <- c(icdif_vals, icdif)
   }
 
-  row[["JSD_avg"]] <- if (length(jsd_vals) == 2) mean(jsd_vals) else NA
+  row[["JSD_avg"]]    <- if (length(jsd_vals)   == 2) mean(jsd_vals)   else NA
+  row[["JSD_max"]]    <- if (length(jsd_vals)   == 2) max(jsd_vals)    else NA
+  row[["ICdiff_avg"]] <- if (length(icdif_vals) == 2) mean(icdif_vals) else NA
+
+  # --- CDR3 length distributions and mean lengths ---
+  all_lengths <- paste0("L_", 7:22)
+  pct_list <- lapply(chains, function(chain) {
+    cnt <- es$countL[[chain]]
+    pct <- setNames(rep(0, length(all_lengths)), all_lengths)
+    shared <- intersect(names(cnt), all_lengths)
+    pct[shared] <- cnt[shared] / sum(cnt)
+    pct
+  })
+  lengths_numeric <- as.numeric(sub("L_", "", all_lengths))
+  pct_avg <- (pct_list[[1]] + pct_list[[2]]) / 2
+  row[["mean_CDR3A_length"]] <- sum(pct_list[["CDR3A"]] * lengths_numeric)
+  row[["mean_CDR3B_length"]] <- sum(pct_list[["CDR3B"]] * lengths_numeric)
+  row[["mean_CDR3_length"]]  <- sum(pct_avg * lengths_numeric)
+
+  # --- TRAV12-2 enrichment over baseline ---
+  trav <- "TRAV12-2"
+  inp_trav <- es$countV[["TRA"]]
+  inp_freq  <- if (trav %in% names(inp_trav)) inp_trav[[trav]] / sum(inp_trav) else 0
+  bas_freq  <- if (trav %in% names(baseline$countV[["TRA"]])) baseline$countV[["TRA"]][[trav]] else NA
+  row[["TRAV12_2_enrichment"]] <- if (!is.na(bas_freq) && bas_freq > 0) inp_freq / bas_freq else NA
   as.data.frame(row, stringsAsFactors = FALSE)
 })
 
 result_table <- bind_rows(results)
 print(result_table)
+write.csv(result_table, file = "../cdr3_specificity.csv", row.names = FALSE)
