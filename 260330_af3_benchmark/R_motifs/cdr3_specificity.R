@@ -197,12 +197,6 @@ results <- lapply(models, function(model) {
   row[["mean_CDR3B_length"]] <- sum(pct_list[["CDR3B"]] * lengths_numeric)
   row[["mean_CDR3_length"]]  <- sum(pct_avg * lengths_numeric)
 
-  # --- TRAV12-2 enrichment over baseline ---
-  trav <- "TRAV12-2"
-  inp_trav <- es$countV[["TRA"]]
-  inp_freq  <- if (trav %in% names(inp_trav)) inp_trav[[trav]] / sum(inp_trav) else 0
-  bas_freq  <- if (trav %in% names(baseline$countV[["TRA"]])) baseline$countV[["TRA"]][[trav]] else NA
-  row[["TRAV12_2_enrichment"]] <- if (!is.na(bas_freq) && bas_freq > 0) inp_freq / bas_freq else NA
   as.data.frame(row, stringsAsFactors = FALSE)
 })
 

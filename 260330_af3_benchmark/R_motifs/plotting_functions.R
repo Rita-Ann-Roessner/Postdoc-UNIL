@@ -651,9 +651,13 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
     baseline_df <- ld.df[ld.df$v3 == baseline_name, , drop = FALSE]
     
     point_size <- ifelse(plot.oneline == 0, 2.5, 2)
-    
+
+    # Input color: match original MixTCRviz (ggplot2 default 1st hue) when plain;
+    # use grey when pLDDT fill carries the colour information.
+    input_color <- if (is.null(plddtL.es)) "#F8766D" else "grey70"
+
     ld.plot <- ggplot()
-    
+
     if (plot.sd && (!is.null(sd.es) || !is.null(sd.rep))) {
       if (nrow(input_df) > 0 && !is.null(sd.es)) {
         ld.plot <- ld.plot +
@@ -662,7 +666,7 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
             aes(x = v1, ymin = pmax(v2 - SD, 0.001), ymax = v2 + SD),
             width = 0.3,
             linewidth = 0.4,
-            color = "grey50"
+            color = input_color
           )
       }
       if (nrow(baseline_df) > 0 && !is.null(sd.rep)) {
@@ -672,11 +676,11 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
             aes(x = v1, ymin = pmax(v2 - SD, 0.001), ymax = v2 + SD),
             width = 0.3,
             linewidth = 0.4,
-            color = "grey50"
+            color = "#56BCC2"
           )
       }
     }
-    
+
     ld.plot <- ld.plot +
       geom_line(
         data = ld.df,
@@ -690,7 +694,7 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
         shape = 17,
         size = point_size
       )
-    
+
     if (!is.null(plddtL.es)) {
       ld.plot <- ld.plot +
         geom_point(
@@ -717,17 +721,17 @@ plotLD <- function(countL.es, countL.rep, plddtL.es = NULL, info = NULL,
         geom_point(
           data = input_df,
           aes(x = v1, y = v2),
-          color = "black",
+          color = input_color,
           shape = 16,
           size = point_size
         )
     }
-    
+
     ld.plot <- ld.plot +
       scale_color_manual(
         values = c(
-          setNames("grey70", input_name),
-          setNames("#56BCC2", baseline_name)
+          setNames(input_color, input_name),
+          setNames("#56BCC2",   baseline_name)
         )
       ) +
       guides(
