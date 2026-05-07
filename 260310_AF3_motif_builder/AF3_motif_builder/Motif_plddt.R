@@ -12,17 +12,17 @@ source("plotting_functions.R")
 # =============================================================================
 # Config — change these for each new dataset / system
 # =============================================================================
-motif_file            <- "../LLWNGPMAV/A0201_LLWNGPMAV.csv"   # pre-filtered model TCRs
-baseline_file         <- NULL #"../step1_LLWNGPMAV/baseline.txt"                            # baseline TCRs (set to NULL when use_internal_baseline=TRUE)
+motif_file            <- "../step1_GILGFVFTL/model.txt"   # pre-filtered model TCRs
+baseline_file         <- "../step1_GILGFVFTL/baseline.txt"                            # baseline TCRs (set to NULL when use_internal_baseline=TRUE)
 
 renormVJ              <- TRUE
-use_internal_baseline <- TRUE   # TRUE: use MixTCRviz::baseline_HomoSapiens
+use_internal_baseline <- FALSE   # TRUE: use MixTCRviz::baseline_HomoSapiens
 # FALSE: use baseline_file as baseline
 use_plddt             <- FALSE    # TRUE: also save pLDDT-annotated motif; FALSE: skip pLDDT output
 plddt_file            <- NULL           # per-residue pLDDT values (ignored when use_plddt=FALSE)
-out_plddt_motif       <- "../LLWNGPMAV/motif_plddt.png"               # motif with pLDDT coloring (only used when use_plddt=TRUE)
-out_plain_motif       <- "../LLWNGPMAV/motif_plain.png"               # standard motif
-out_enrichment        <- "../LLWNGPMAV/enrichment.csv"               # V/J enrichment table
+out_plddt_motif       <- ".../step1_GILGFVFTL/motif_plddt.png"               # motif with pLDDT coloring (only used when use_plddt=TRUE)
+out_plain_motif       <- "../step1_GILGFVFTL/motif_plain.png"               # standard motif
+out_enrichment        <- "../step1_GILGFVFTL/enrichment.csv"               # V/J enrichment table
 # =============================================================================
 
 # -- Utility functions --------------------------------------------------------
