@@ -40,14 +40,12 @@ predictor <- TEMPOtrain(input.train = paste0("A0201_LLWNGPMAV_", batch, ".csv"),
 peptides <- c('ELAGIGILTV', 'GILGFVFTL', 'LLWNGPMAV')
 
 for (peptide in peptides) {
-  for (chain in chains) {
     indir  <- file.path('../dummy_chains', paste0('step1_dummy_', peptide))
     outdir <- file.path(indir, 'TEMPO')
     
     predictor <- TEMPOtrain(input.train = file.path(indir, 'model.csv'), output.path = outdir,
-      input.pred      = 'validation.csv', filename.train  = 'train', filename.pred  = 'pred',
-      build.prank     = TRUE, compute.prank = TRUE, write.data.pred = TRUE, write.data.train = TRUE, write.predictor = TRUE)
-  }
+      input.pred      = file.path("..", peptide, 'validation.csv'), filename.train  = 'train', filename.pred  = 'pred',
+      build.prank     = F, compute.prank = F, write.data.pred = T, write.data.train = T, write.predictor = F)
 }  
 
 # random pairing
@@ -58,8 +56,8 @@ for (peptide in peptides) {
   outdir <- file.path(indir, 'TEMPO')
   
   predictor <- TEMPOtrain(input.train = file.path(indir, 'model.csv'), output.path = outdir,
-    input.pred = 'validation.csv', filename.train = 'train', filename.pred = 'pred',
-    build.prank = TRUE, compute.prank = TRUE, write.data.pred = TRUE, write.data.train = TRUE, write.predictor = TRUE)
+    input.pred = file.path("..", peptide, 'validation.csv'), filename.train = 'train', filename.pred = 'pred',
+    build.prank     = F, compute.prank = F, write.data.pred = T, write.data.train = T, write.predictor = F)
 }
   
   
