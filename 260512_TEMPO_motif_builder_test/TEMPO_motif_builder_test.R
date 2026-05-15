@@ -25,11 +25,13 @@ library(pROC)
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/HomoSapiens"
 BASE_OUTPUT_DIR <- "."
 SCORE_COL       <- "perc_rank" # lower = better binder (HLA convention)
-N_ITERATIONS    <- 3           # refinement iterations after iteration 0
-N_ENRICHMENT    <- 20          # top-N V/J genes kept per column after enrichment
+N_ITERATIONS    <- 3           # scoring+enrichment steps (steps 1–N); step 0 is always flat random
+N_ENRICHMENT    <- 19          # top-N V/J genes kept per column after enrichment
 N_CDR3_MULTI    <- 5           # CDR3 sequences sampled per V/J pair (iterations > 0)
-SCORE_THRESHOLD <- 10          # keep TCRs with perc_rank < threshold (top 10 %)
-PSSM_WEIGHT     <- 0.5        # blend weight: 0 = pure baseline, 1 = pure PSSM
+INIT_PERC_RANK  <- 10          # fixed threshold for scoring initial random pairs (pre-loop)
+PERC_RANK_MID <- 9.8           # start of geometric decay schedule (optimizable; range 1–10)
+                               # full schedule: [INIT_PERC_RANK, start, sqrt(start*0.05), 0.05]
+PSSM_WEIGHT     <- 0.66        # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM   <- 30         # minimum high-scorers required before using a PSSM
 
 dico <- list(
@@ -191,13 +193,16 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
   # (2) Sample n lengths with replacement from enriched distribution
   if (!is.null(len_dist)) {
     valid_lens <- intersect(names(len_dist), lengths_available)
-    if (length(valid_lens) == 0) valid_lens <- lengths_available
-    probs          <- unlist(len_dist[valid_lens])
-    probs          <- probs / sum(probs)
-    selected_lens  <- sample(valid_lens, size = n, replace = TRUE, prob = probs)
+    if (length(valid_lens) > 0) {
+      probs         <- unlist(len_dist[valid_lens])
+      probs         <- probs / sum(probs)
+      selected_lens <- sample(valid_lens, size = n, replace = TRUE, prob = probs)
+    } else {
+      # no overlap between enriched lengths and this V/J pair — sample uniformly
+      selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
+    }
   } else {
-    n_avail       <- length(lengths_available)
-    selected_lens <- sample(lengths_available, size = min(n, n_avail))
+    selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
   }
 
   seqs <- vapply(selected_lens, function(len_name) {
@@ -283,6 +288,24 @@ pair_alpha_beta_multi <- function(file_a, file_b, output_file, n = 5) {
   df_paired <- cbind(df_A, df_B)
   write.csv(df_paired, output_file, row.names = FALSE)
   df_paired
+}
+
+
+# =============================================================================
+# Module 4a — MixTCRviz motif plot per iteration
+# =============================================================================
+
+plot_iter_motif <- function(top_tcrs, all_tcrs, peptide, iter, output_dir) {
+  message(sprintf("  Plotting MixTCRviz motif (iter %d, n_top=%d)", iter, nrow(top_tcrs)))
+  MixTCRviz(
+    input1      = top_tcrs,
+    input2      = all_tcrs,
+    output.path = output_dir,
+    plot        = TRUE,
+    renormVJ    = TRUE,
+    set.title   = sprintf("%s — iter %d top binders (n=%d)", peptide, iter, nrow(top_tcrs)),
+    verbose     = 0
+  )
 }
 
 
@@ -474,140 +497,188 @@ validate_motif <- function(motif_file, validation_file, output_dir,
 
 
 # =============================================================================
+# Module 7 — Single enrichment step (score → filter → enrich → generate)
+#
+# Shared by the pre-loop step (threshold = INIT_PERC_RANK) and every loop
+# iteration (threshold from geometric schedule).  Returns a list with the
+# path to the newly generated model.csv and summary stats, or NULL if too
+# few top binders were found.
+# =============================================================================
+
+run_enrichment_step <- function(predictor_rds, current_model_csv, threshold,
+                                 step, peptide, mhc,
+                                 base_output_dir, cdr3_baseline,
+                                 n_enrichment, n_cdr3_multi,
+                                 pssm_weight, min_tcrs_pssm,
+                                 score_col, plot_motif = TRUE) {
+
+  step_dir <- file.path(base_output_dir, sprintf("TEMPO_step%d_%s", step, peptide))
+  dir.create(step_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # Score
+  pred_output <- run_tempo_scoring(
+    predictor_rds = predictor_rds,
+    pred_file     = current_model_csv,
+    output_dir    = file.path(step_dir, "TEMPO_scoring")
+  )
+  scored_tcrs <- load_tempo_scores(pred_output, current_model_csv, score_col)
+  top_tcrs    <- scored_tcrs[scored_tcrs[[score_col]] < threshold, ]
+
+  message(sprintf("  [Step %d] %d / %d TCRs with %s < %.2f",
+                  step, nrow(top_tcrs), nrow(scored_tcrs), score_col, threshold))
+
+  if (nrow(top_tcrs) < 10) {
+    warning(sprintf("Too few high-scoring TCRs at step %d — stopping.", step))
+    return(NULL)
+  }
+
+  if (plot_motif) {
+    plot_iter_motif(top_tcrs, scored_tcrs, peptide, step,
+                    output_dir = file.path(step_dir, "motif"))
+  }
+
+  # (1) V/J enrichment
+  enriched   <- compute_vj_enrichment(scored_tcrs, top_tcrs, n = n_enrichment)
+
+  # (2) CDR3 length distribution
+  len_dist_A <- extract_cdr3_len_dist(top_tcrs, "A")
+  len_dist_B <- extract_cdr3_len_dist(top_tcrs, "B")
+
+  # (3) PSSM
+  if (nrow(top_tcrs) >= min_tcrs_pssm) {
+    pssm_A <- build_cdr3_pssm(top_tcrs$cdr3_TRA)
+    pssm_B <- build_cdr3_pssm(top_tcrs$cdr3_TRB)
+    message(sprintf("  PSSM built from %d high-scoring TCRs", nrow(top_tcrs)))
+  } else {
+    pssm_A <- pssm_B <- NULL
+    message(sprintf("  Too few high-scorers for PSSM (%d < %d)", nrow(top_tcrs), min_tcrs_pssm))
+  }
+
+  # Generate enriched batch — saved in the same step_dir
+  generate_enriched_vj_pairs(enriched, step_dir)
+
+  sample_chain_cdr3_multi("TRA",
+                          file.path(step_dir, "TRAV_TRAJ.csv"), cdr3_baseline,
+                          file.path(step_dir, "TRAV_TRAJ_cdr3.csv"),
+                          n = n_cdr3_multi, len_dist = len_dist_A,
+                          cdr3_pssm = pssm_A, pssm_weight = pssm_weight)
+
+  sample_chain_cdr3_multi("TRB",
+                          file.path(step_dir, "TRBV_TRBJ.csv"), cdr3_baseline,
+                          file.path(step_dir, "TRBV_TRBJ_cdr3.csv"),
+                          n = n_cdr3_multi, len_dist = len_dist_B,
+                          cdr3_pssm = pssm_B, pssm_weight = pssm_weight)
+
+  df_paired <- pair_alpha_beta_multi(
+    file.path(step_dir, "TRAV_TRAJ_cdr3.csv"),
+    file.path(step_dir, "TRBV_TRBJ_cdr3.csv"),
+    file.path(step_dir, "chainA_B_random_pair.csv"),
+    n = n_cdr3_multi
+  )
+  prepare_model_csv(df_paired, peptide, mhc, file.path(step_dir, "model.csv"))
+
+  list(
+    next_model_csv = file.path(step_dir, "model.csv"),
+    n_total_tcrs   = nrow(scored_tcrs),
+    n_top_tcrs     = nrow(top_tcrs),
+    pssm_built     = !is.null(pssm_A)
+  )
+}
+
+
+# =============================================================================
 # Main pipeline
 # =============================================================================
 
 run_motif_builder <- function(peptide, mhc,
-                               base_output_dir    = BASE_OUTPUT_DIR,
-                               input_dir          = INPUT_DIR,
+                               base_output_dir  = BASE_OUTPUT_DIR,
+                               input_dir        = INPUT_DIR,
                                cdr3_baseline,
                                known_binders_file,
                                validation_file,
-                               n_iterations       = N_ITERATIONS,
-                               n_enrichment       = N_ENRICHMENT,
-                               n_cdr3_multi       = N_CDR3_MULTI,
-                               score_threshold    = SCORE_THRESHOLD,
-                               pssm_weight        = PSSM_WEIGHT,
-                               min_tcrs_pssm      = MIN_TCRS_PSSM,
-                               score_col          = SCORE_COL) {
+                               n_iterations     = N_ITERATIONS,
+                               n_enrichment     = N_ENRICHMENT,
+                               n_cdr3_multi     = N_CDR3_MULTI,
+                               init_perc_rank   = INIT_PERC_RANK,
+                               perc_rank_mid  = PERC_RANK_MID,
+                               pssm_weight      = PSSM_WEIGHT,
+                               min_tcrs_pssm    = MIN_TCRS_PSSM,
+                               score_col        = SCORE_COL,
+                               plot_motif       = TRUE) {
 
   results <- list()
 
   # ------------------------------------------------------------------
-  # Build (or reload) the TEMPO predictor once for the whole pipeline
+  # Full threshold schedule: length = n_iterations
+  # Step 1 always uses init_perc_rank (10), final step always 0.05,
+  # middle steps follow geometric decay from perc_rank_mid.
+  # e.g. N_ITERATIONS=3 → [10, perc_rank_mid, 0.05]
   # ------------------------------------------------------------------
-  predictor_rds <- file.path(base_output_dir, paste0("predictor_", peptide, ".rds"))
+  if (n_iterations == 1) {
+    perc_rank_schedule <- init_perc_rank
+  } else {
+    perc_rank_schedule <- c(init_perc_rank,
+                            exp(seq(log(perc_rank_mid), log(0.05),
+                                    length.out = n_iterations - 1)))
+  }
+  message(sprintf("[%s] perc_rank schedule: %s",
+                  peptide,
+                  paste(sprintf("%.3f", perc_rank_schedule), collapse = " → ")))
+
+  # ------------------------------------------------------------------
+  # Build (or reload) TEMPO predictor once
+  # ------------------------------------------------------------------
+  predictor_rds <- file.path(BASE_OUTPUT_DIR, paste0("predictor_", peptide, ".rds"))
   predictor_rds <- build_tempo_predictor(known_binders_file, predictor_rds)
 
   # ------------------------------------------------------------------
-  # Iteration 0: flat random sampling — no priors
+  # Step 0: flat random TCR generation — no priors
   # ------------------------------------------------------------------
-  message(sprintf("\n[%s] Iteration 0: random TCR generation (flat baseline)", peptide))
+  message(sprintf("\n[%s] Step 0: random TCR generation (flat baseline)", peptide))
 
-  iter0_dir <- file.path(base_output_dir, paste0("TEMPO_step0_", peptide))
-  dir.create(iter0_dir, showWarnings = FALSE, recursive = TRUE)
+  step0_dir <- file.path(base_output_dir, sprintf("TEMPO_step0_%s", peptide))
+  dir.create(step0_dir, showWarnings = FALSE, recursive = TRUE)
 
-  generate_vj_pairs("A", input_dir, iter0_dir)
-  generate_vj_pairs("B", input_dir, iter0_dir)
-  sample_chain_cdr3("TRA", file.path(iter0_dir, "TRAV_TRAJ.csv"),
-                    cdr3_baseline, file.path(iter0_dir, "TRAV_TRAJ_cdr3.csv"))
-  sample_chain_cdr3("TRB", file.path(iter0_dir, "TRBV_TRBJ.csv"),
-                    cdr3_baseline, file.path(iter0_dir, "TRBV_TRBJ_cdr3.csv"))
-
-  df_paired <- pair_alpha_beta(
-    file.path(iter0_dir, "TRAV_TRAJ_cdr3.csv"),
-    file.path(iter0_dir, "TRBV_TRBJ_cdr3.csv"),
-    file.path(iter0_dir, "chainA_B_random_pair.csv")
+  generate_vj_pairs("A", input_dir, step0_dir)
+  generate_vj_pairs("B", input_dir, step0_dir)
+  sample_chain_cdr3("TRA", file.path(step0_dir, "TRAV_TRAJ.csv"),
+                    cdr3_baseline, file.path(step0_dir, "TRAV_TRAJ_cdr3.csv"))
+  sample_chain_cdr3("TRB", file.path(step0_dir, "TRBV_TRBJ.csv"),
+                    cdr3_baseline, file.path(step0_dir, "TRBV_TRBJ_cdr3.csv"))
+  df_paired0 <- pair_alpha_beta(
+    file.path(step0_dir, "TRAV_TRAJ_cdr3.csv"),
+    file.path(step0_dir, "TRBV_TRBJ_cdr3.csv"),
+    file.path(step0_dir, "chainA_B_random_pair.csv")
   )
-  prepare_model_csv(df_paired, peptide, mhc, file.path(iter0_dir, "model.csv"))
-
-  current_model_csv <- file.path(iter0_dir, "model.csv")
+  prepare_model_csv(df_paired0, peptide, mhc, file.path(step0_dir, "model.csv"))
+  current_model_csv <- file.path(step0_dir, "model.csv")
 
   # ------------------------------------------------------------------
-  # Refinement loop
+  # Unified loop: N_ITERATIONS scoring+enrichment steps (steps 1..N)
+  # Each step scores the current TCRs and generates the next batch.
   # ------------------------------------------------------------------
   for (iter in seq_len(n_iterations)) {
-    message(sprintf("[%s] Iteration %d", peptide, iter))
+    threshold <- perc_rank_schedule[iter]
+    message(sprintf("[%s] Step %d / %d (threshold = %.3f)", peptide, iter, n_iterations, threshold))
 
-    iter_dir  <- file.path(base_output_dir, sprintf("TEMPO_step%d_%s", iter, peptide))
-    dir.create(iter_dir, showWarnings = FALSE, recursive = TRUE)
-
-    # Score current random TCRs using the cached predictor (returns perc_rank)
-    pred_output <- run_tempo_scoring(
-      predictor_rds = predictor_rds,
-      pred_file     = current_model_csv,
-      output_dir    = file.path(iter_dir, "TEMPO_scoring")
+    step_result <- run_enrichment_step(
+      predictor_rds     = predictor_rds,
+      current_model_csv = current_model_csv,
+      threshold         = threshold,
+      step              = iter,
+      peptide           = peptide, mhc = mhc,
+      base_output_dir   = base_output_dir,
+      cdr3_baseline     = cdr3_baseline,
+      n_enrichment      = n_enrichment,
+      n_cdr3_multi      = n_cdr3_multi,
+      pssm_weight       = pssm_weight,
+      min_tcrs_pssm     = min_tcrs_pssm,
+      score_col         = score_col,
+      plot_motif        = plot_motif
     )
-
-    scored_tcrs <- load_tempo_scores(pred_output, current_model_csv, score_col)
-    # perc_rank: lower = better binder
-    top_tcrs    <- scored_tcrs[scored_tcrs[[score_col]] < score_threshold, ]
-
-    message(sprintf("  %d / %d random TCRs with %s < %.1f",
-                    nrow(top_tcrs), nrow(scored_tcrs), score_col, score_threshold))
-
-    if (nrow(top_tcrs) < 10) {
-      warning("Too few high-scoring TCRs — consider lowering score_threshold. Stopping early.")
-      break
-    }
-
-    # (1) V/J enrichment
-    enriched <- compute_vj_enrichment(scored_tcrs, top_tcrs, n = n_enrichment)
-
-    # (2) CDR3 length distributions from high-scoring TCRs
-    len_dist_A <- extract_cdr3_len_dist(top_tcrs, "A")
-    len_dist_B <- extract_cdr3_len_dist(top_tcrs, "B")
-
-    # (3) PSSM from high-scoring TCRs — only when enough data are available
-    if (nrow(top_tcrs) >= min_tcrs_pssm) {
-      pssm_A <- build_cdr3_pssm(top_tcrs$cdr3_TRA)
-      pssm_B <- build_cdr3_pssm(top_tcrs$cdr3_TRB)
-      message(sprintf("  PSSM built from %d high-scoring TCRs", nrow(top_tcrs)))
-    } else {
-      pssm_A <- pssm_B <- NULL
-      message(sprintf("  Too few high-scorers for PSSM (%d < %d) — using baseline CDR3",
-                      nrow(top_tcrs), min_tcrs_pssm))
-    }
-
-    # Generate enriched TCRs using all three refinements
-    generate_enriched_vj_pairs(enriched, iter_dir)
-
-    sample_chain_cdr3_multi("TRA",
-                            file.path(iter_dir, "TRAV_TRAJ.csv"),
-                            cdr3_baseline,
-                            file.path(iter_dir, "TRAV_TRAJ_cdr3.csv"),
-                            n           = n_cdr3_multi,
-                            len_dist    = len_dist_A,
-                            cdr3_pssm   = pssm_A,
-                            pssm_weight = pssm_weight)
-
-    sample_chain_cdr3_multi("TRB",
-                            file.path(iter_dir, "TRBV_TRBJ.csv"),
-                            cdr3_baseline,
-                            file.path(iter_dir, "TRBV_TRBJ_cdr3.csv"),
-                            n           = n_cdr3_multi,
-                            len_dist    = len_dist_B,
-                            cdr3_pssm   = pssm_B,
-                            pssm_weight = pssm_weight)
-
-    df_paired_iter <- pair_alpha_beta_multi(
-      file.path(iter_dir, "TRAV_TRAJ_cdr3.csv"),
-      file.path(iter_dir, "TRBV_TRBJ_cdr3.csv"),
-      file.path(iter_dir, "chainA_B_random_pair.csv"),
-      n = n_cdr3_multi
-    )
-    prepare_model_csv(df_paired_iter, peptide, mhc,
-                      file.path(iter_dir, "model.csv"))
-
-    results[[paste0("iter", iter)]] <- list(
-      n_top_tcrs = nrow(top_tcrs),
-      enriched   = enriched,
-      len_dist_A = len_dist_A,
-      len_dist_B = len_dist_B,
-      pssm_built = !is.null(pssm_A)
-    )
-
-    current_model_csv <- file.path(iter_dir, "model.csv")
+    if (is.null(step_result)) break
+    results[[paste0("step", iter)]] <- step_result
+    current_model_csv <- step_result$next_model_csv
   }
 
   # ------------------------------------------------------------------
@@ -627,34 +698,48 @@ run_motif_builder <- function(peptide, mhc,
   results[["final_auc01"]] <- auc_result$auc01
   results[["final_roc"]]   <- auc_result$roc
   results[["final_pred"]]  <- auc_result$pred
+
+  # Flatten per-step counts for easy logging
+  step_keys <- grep("^step", names(results), value = TRUE)
+  results[["step_counts"]] <- do.call(rbind, lapply(step_keys, function(k) {
+    data.frame(step    = as.integer(sub("^step", "", k)),
+               n_total = results[[k]]$n_total_tcrs,
+               n_top   = results[[k]]$n_top_tcrs)
+  }))
+
   results
 }
 
 
 ### ---- Run ------------------------------------------------------------------
+# Guard: only execute when run directly, not when sourced by the optimizer.
 
 baseline      <- MixTCRviz::baseline_HomoSapiens
 cdr3_baseline <- baseline$countCDR3.VJL
 
-auc_summary <- list()
+if (!exists(".sourced_by_optimizer") || !.sourced_by_optimizer) {
 
-for (peptide in names(dico)) {
-  mhc <- dico[[peptide]]
-  message(sprintf("\n========== %s / %s ==========", peptide, mhc))
+  auc_summary <- list()
 
-  res <- run_motif_builder(
-    peptide            = peptide,
-    mhc                = mhc,
-    cdr3_baseline      = cdr3_baseline,
-    known_binders_file = file.path(peptide, paste0("A0201_", peptide, ".csv")),
-    validation_file    = file.path(peptide, "validation.csv")
-  )
+  for (peptide in names(dico)) {
+    mhc <- dico[[peptide]]
+    message(sprintf("\n========== %s / %s ==========", peptide, mhc))
 
-  auc_summary[[peptide]] <- list(auc = res$final_auc, auc01 = res$final_auc01)
-}
+    res <- run_motif_builder(
+      peptide            = peptide,
+      mhc                = mhc,
+      cdr3_baseline      = cdr3_baseline,
+      known_binders_file = file.path(peptide, paste0("A0201_", peptide, ".csv")),
+      validation_file    = file.path(peptide, "validation.csv")
+    )
 
-message("\n===== AUC Summary =====")
-for (nm in names(auc_summary)) {
-  message(sprintf("  %s: AUC = %.4f  |  AUC0.1 = %.4f",
-                  nm, auc_summary[[nm]]$auc, auc_summary[[nm]]$auc01))
+    auc_summary[[peptide]] <- list(auc = res$final_auc, auc01 = res$final_auc01)
+  }
+
+  message("\n===== AUC Summary =====")
+  for (nm in names(auc_summary)) {
+    message(sprintf("  %s: AUC = %.4f  |  AUC0.1 = %.4f",
+                    nm, auc_summary[[nm]]$auc, auc_summary[[nm]]$auc01))
+  }
+
 }
