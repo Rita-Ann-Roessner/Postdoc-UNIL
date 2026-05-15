@@ -27,8 +27,8 @@ N_ITERATIONS    <- 3           # scoring+enrichment steps (steps 1–N); step 0 
 N_PAIRS         <- 400         # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI    <- 5           # CDR3 sequences sampled per V/J pair (iterations > 0)
 INIT_PERC_RANK  <- 10          # threshold for step 0; decays each step by DECAY_FACTOR
-DECAY_FACTOR    <- 0.2         # multiplicative decay per step: step k uses INIT × DECAY^k
-PSSM_WEIGHT     <- 0.66        # blend weight: 0 = pure baseline, 1 = pure PSSM
+DECAY_FACTOR    <- 0.4         # multiplicative decay per step: step k uses INIT × DECAY^k
+PSSM_WEIGHT     <- 0.4        # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM   <- 30         # minimum high-scorers required before using a PSSM
 
 dico <- list(
@@ -446,7 +446,8 @@ load_tempo_scores <- function(pred_output_file, model_file, score_col) {
 # =============================================================================
 
 validate_motif <- function(motif_file, validation_file, output_dir,
-                            peptide, mhc, score_col = "score") {
+                            peptide, mhc,
+                            score_col = "score", plot = TRUE) {
   dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
   TEMPOtrain(
     input.train      = motif_file,
@@ -472,26 +473,29 @@ validate_motif <- function(motif_file, validation_file, output_dir,
 
   pred_df <- pred_df[!is.na(pred_df[[score_col]]), ]
 
-  roc_obj  <- roc(pred_df$Label, pred_df[[score_col]], quiet = TRUE)
-  auc_val  <- as.numeric(auc(roc_obj))
+  roc_obj   <- roc(pred_df$Label, pred_df[[score_col]], quiet = TRUE)
+  auc_val   <- as.numeric(auc(roc_obj))
   auc01_val <- as.numeric(auc(roc_obj,
-                              partial.auc         = c(1, 0.9),
-                              partial.auc.correct = TRUE,
-                              partial.auc.focus   = "specificity"))
-
-  plot(roc_obj,
-       main = sprintf("ROC — %s_%s", mhc, peptide),
-       col  = "#2166ac", lwd = 2,
-       xaxt = "n",
-       xlab = "FPR (1 - Specificity)",
-       ylab = "TPR (Sensitivity)")
-  axis(1, at = seq(1, 0, -0.2), labels = seq(0, 1, 0.2))
-  legend("bottomright", bty = "o", bg = "white",
-         box.col = "grey80",
-         legend  = c(sprintf("AUC    = %.4f", auc_val),
-                     sprintf("AUC0.1 = %.4f", auc01_val)))
+                               partial.auc         = c(1, 0.9),
+                               partial.auc.correct = TRUE,
+                               partial.auc.focus   = "specificity"))
 
   message(sprintf("  AUC = %.4f  |  AUC0.1 = %.4f", auc_val, auc01_val))
+
+  if (plot) {
+    plot(roc_obj,
+         main = sprintf("ROC - %s_%s", mhc, peptide),
+         col  = "#2166ac", lwd = 2,
+         xaxt = "n",
+         xlab = "FPR (1 - Specificity)",
+         ylab = "TPR (Sensitivity)")
+    axis(1, at = seq(1, 0, -0.2), labels = seq(0, 1, 0.2))
+    legend("bottomright", bty = "o", bg = "white",
+           box.col = "grey80",
+           legend  = c(sprintf("AUC    = %.4f", auc_val),
+                       sprintf("AUC0.1 = %.4f", auc01_val)))
+  }
+
   list(auc = auc_val, auc01 = auc01_val, roc = roc_obj, pred = pred_df)
 }
 
@@ -672,10 +676,9 @@ run_motif_builder <- function(peptide, mhc,
     score_col       = score_col,
     plot_motif      = plot_motif
   )
-  step_counts[[1]] <- data.frame(step = 0L,
+  step_counts[[1]] <- data.frame(step    = 0L,
                                   n_total = scored0$n_total,
                                   n_top   = scored0$n_top)
-
   top_tcrs          <- scored0$top_tcrs
   all_tcrs          <- scored0$all_tcrs
   current_model_csv <- file.path(step0_dir, "model.csv")
@@ -719,10 +722,9 @@ run_motif_builder <- function(peptide, mhc,
       score_col       = score_col,
       plot_motif      = plot_motif
     )
-    step_counts[[iter + 1L]] <- data.frame(step = iter,
+    step_counts[[iter + 1L]] <- data.frame(step    = iter,
                                             n_total = scored_i$n_total,
                                             n_top   = scored_i$n_top)
-
     top_tcrs          <- scored_i$top_tcrs
     all_tcrs          <- scored_i$all_tcrs
     current_model_csv <- new_model_csv
@@ -737,8 +739,8 @@ run_motif_builder <- function(peptide, mhc,
     motif_file      = current_model_csv,
     validation_file = validation_file,
     output_dir      = file.path(base_output_dir, sprintf("TEMPO_validation_%s", peptide)),
-    peptide         = peptide,
-    mhc             = mhc
+    peptide         = peptide, mhc = mhc,
+    plot            = plot_motif
   )
 
   list(
@@ -753,11 +755,15 @@ run_motif_builder <- function(peptide, mhc,
 
 ### ---- Run ------------------------------------------------------------------
 # Guard: only execute when run directly, not when sourced by the optimizer.
+# Capture then immediately reset the flag so it never carries over between runs.
 
 baseline      <- MixTCRviz::baseline_HomoSapiens
 cdr3_baseline <- baseline$countCDR3.VJL
 
-if (!exists(".sourced_by_optimizer") || !.sourced_by_optimizer) {
+.run_pipeline         <- !exists(".sourced_by_optimizer") || !.sourced_by_optimizer
+.sourced_by_optimizer <- FALSE   # reset so future direct runs always work
+
+if (.run_pipeline) {
 
   auc_summary <- list()
 

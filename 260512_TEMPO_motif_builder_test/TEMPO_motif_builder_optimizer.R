@@ -64,20 +64,13 @@ objective <- function(pssm_weight, decay_factor) {
   # build long-format rows: one per peptide × step
   new_rows <- do.call(rbind, lapply(names(dico), function(p) {
     res_p  <- res_list[[p]]
-    counts <- if (!is.null(res_p) && !is.null(res_p$step_counts))
-                res_p$step_counts
-              else
-                data.frame(step = NA, n_total = NA, n_top = NA)
     data.frame(
-      run_id          = run_id,
-      pssm_weight     = pssm_weight,
-      decay_factor    = decay_factor,
-      mean_auc01      = score,
-      peptide         = p,
-      auc01           = auc01_vals[[p]],
-      step            = counts$step,
-      n_total         = counts$n_total,
-      n_top           = counts$n_top,
+      run_id       = run_id,
+      pssm_weight  = pssm_weight,
+      decay_factor = decay_factor,
+      mean_auc01   = score,
+      peptide      = p,
+      auc01        = auc01_vals[[p]],
       stringsAsFactors = FALSE
     )
   }))
