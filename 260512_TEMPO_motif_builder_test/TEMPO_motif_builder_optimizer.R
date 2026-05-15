@@ -26,10 +26,8 @@ dir.create(OPTIMIZER_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 eval_log <- data.frame()
 
-objective <- function(n_enrichment, pssm_weight, perc_rank_mid) {
-  n_enrichment <- as.integer(round(n_enrichment))
-
-  run_id  <- sprintf("ne%02d_pw%.2f_prs%.2f", n_enrichment, pssm_weight, perc_rank_mid)
+objective <- function(pssm_weight, decay_factor) {
+  run_id  <- sprintf("pw%.2f_df%.3f", pssm_weight, decay_factor)
   message(sprintf("\n>>> Evaluating: %s", run_id))
 
   res_list <- list()
@@ -45,9 +43,8 @@ objective <- function(n_enrichment, pssm_weight, perc_rank_mid) {
         cdr3_baseline      = cdr3_baseline,
         known_binders_file = file.path(peptide, paste0("A0201_", peptide, ".csv")),
         validation_file    = file.path(peptide, "validation.csv"),
-        n_enrichment       = n_enrichment,
         pssm_weight        = pssm_weight,
-        perc_rank_mid    = perc_rank_mid,
+        decay_factor       = decay_factor,
         plot_motif         = FALSE
       ),
       error = function(e) {
@@ -73,9 +70,8 @@ objective <- function(n_enrichment, pssm_weight, perc_rank_mid) {
                 data.frame(step = NA, n_total = NA, n_top = NA)
     data.frame(
       run_id          = run_id,
-      n_enrichment    = n_enrichment,
       pssm_weight     = pssm_weight,
-      perc_rank_mid = perc_rank_mid,
+      decay_factor    = decay_factor,
       mean_auc01      = score,
       peptide         = p,
       auc01           = auc01_vals[[p]],
@@ -105,9 +101,8 @@ set.seed(42)
 bayes_result <- BayesianOptimization(
   FUN         = objective,
   bounds      = list(
-    n_enrichment    = c(5L,  20L),
-    pssm_weight     = c(0,   1),
-    perc_rank_mid = c(1,   10)
+    pssm_weight  = c(0,    1),
+    decay_factor = c(0.05, 0.9)
   ),
   init_points = 8,
   n_iter      = 20,
@@ -124,11 +119,9 @@ bayes_result <- BayesianOptimization(
 
 best <- bayes_result$Best_Par
 message("\n===== Best parameters =====")
-message(sprintf("  N_ENRICHMENT    = %d",   as.integer(round(best["n_enrichment"]))))
-message(sprintf("  PSSM_WEIGHT     = %.3f", best["pssm_weight"]))
-message(sprintf("  PERC_RANK_MID = %.3f", best["perc_rank_mid"]))
-message(sprintf("  Best AUC0.1     = %.4f", bayes_result$Best_Value))
-
-schedule <- exp(seq(log(best["perc_rank_mid"]), log(0.05), length.out = N_ITERATIONS))
-message(sprintf("  perc_rank schedule: 10 → %s",
-                paste(sprintf("%.3f", schedule), collapse = " → ")))
+message(sprintf("  PSSM_WEIGHT  = %.3f", best["pssm_weight"]))
+message(sprintf("  DECAY_FACTOR = %.3f", best["decay_factor"]))
+schedule <- INIT_PERC_RANK * best["decay_factor"]^(0:N_ITERATIONS)
+message(sprintf("  threshold schedule: %s",
+                paste(sprintf("%.3f", schedule), collapse = " -> ")))
+message(sprintf("  Best AUC0.1  = %.4f", bayes_result$Best_Value))
