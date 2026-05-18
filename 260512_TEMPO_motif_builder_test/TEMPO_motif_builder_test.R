@@ -27,8 +27,8 @@ N_ITERATIONS    <- 3           # scoring+enrichment steps (steps 1–N); step 0 
 N_PAIRS         <- 400         # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI    <- 5           # CDR3 sequences sampled per V/J pair (iterations > 0)
 INIT_PERC_RANK  <- 10          # threshold for step 0; decays each step by DECAY_FACTOR
-DECAY_FACTOR    <- 0.4         # multiplicative decay per step: step k uses INIT × DECAY^k
-PSSM_WEIGHT     <- 0.4        # blend weight: 0 = pure baseline, 1 = pure PSSM
+DECAY_FACTOR    <- 0.135         # multiplicative decay per step: step k uses INIT × DECAY^k
+PSSM_WEIGHT     <- 0.643        # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM   <- 30         # minimum high-scorers required before using a PSSM
 
 dico <- list(
@@ -290,17 +290,20 @@ pair_alpha_beta_multi <- function(file_a, file_b, output_file) {
 # Module 4a — MixTCRviz motif plot per iteration
 # =============================================================================
 
-plot_iter_motif <- function(top_tcrs, all_tcrs, peptide, iter, output_dir) {
-  message(sprintf("  Plotting MixTCRviz motif (iter %d, n_top=%d)", iter, nrow(top_tcrs)))
-  MixTCRviz(
+plot_iter_motif <- function(top_tcrs, peptide, iter, output_dir, all_tcrs = NULL) {
+  baseline_label <- if (is.null(all_tcrs)) "standard baseline" else "iter TCRs"
+  message(sprintf("  Plotting MixTCRviz motif (iter %d, n_top=%d, baseline=%s)",
+                  iter, nrow(top_tcrs), baseline_label))
+  args <- list(
     input1      = top_tcrs,
-    input2      = all_tcrs,
     output.path = output_dir,
     plot        = TRUE,
     renormVJ    = TRUE,
     set.title   = sprintf("%s - iter %d top binders (n=%d)", peptide, iter, nrow(top_tcrs)),
     verbose     = 0
   )
+  if (!is.null(all_tcrs)) args$input2 <- all_tcrs
+  do.call(MixTCRviz, args)
 }
 
 
@@ -528,8 +531,9 @@ score_step <- function(predictor_rds, model_csv, threshold,
                   step, nrow(top_tcrs), nrow(scored_tcrs), score_col, threshold))
 
   if (plot_motif && nrow(top_tcrs) >= 10) {
-    plot_iter_motif(top_tcrs, scored_tcrs, peptide, step,
-                    output_dir = file.path(step_dir, "motif"))
+    plot_iter_motif(top_tcrs, peptide, step,
+                    output_dir = file.path(step_dir, "motif"),
+                    all_tcrs   = scored_tcrs)
   }
 
   list(
@@ -623,8 +627,10 @@ run_motif_builder <- function(peptide, mhc,
                                decay_factor     = DECAY_FACTOR,
                                pssm_weight      = PSSM_WEIGHT,
                                min_tcrs_pssm    = MIN_TCRS_PSSM,
-                               score_col        = SCORE_COL,
-                               plot_motif       = TRUE) {
+                               score_col          = SCORE_COL,
+                               plot_motif         = FALSE,
+                               plot_final_motif   = TRUE,
+                               validate_each_step = FALSE) {
 
   step_counts <- list()
 
@@ -676,12 +682,24 @@ run_motif_builder <- function(peptide, mhc,
     score_col       = score_col,
     plot_motif      = plot_motif
   )
+  auc01_step0 <- if (validate_each_step) {
+    validate_motif(
+      motif_file      = file.path(step0_dir, "model.csv"),
+      validation_file = validation_file,
+      output_dir      = file.path(step0_dir, "validation"),
+      peptide         = peptide, mhc = mhc, plot = FALSE
+    )$auc01
+  } else NA_real_
+
   step_counts[[1]] <- data.frame(step    = 0L,
                                   n_total = scored0$n_total,
-                                  n_top   = scored0$n_top)
+                                  n_top   = scored0$n_top,
+                                  auc01   = auc01_step0)
   top_tcrs          <- scored0$top_tcrs
   all_tcrs          <- scored0$all_tcrs
+  all_tcrs_combined <- scored0$all_tcrs
   current_model_csv <- file.path(step0_dir, "model.csv")
+  last_step         <- 0L
 
   # ------------------------------------------------------------------
   # Steps 1..N_ITERATIONS: enrich → generate → score
@@ -722,12 +740,41 @@ run_motif_builder <- function(peptide, mhc,
       score_col       = score_col,
       plot_motif      = plot_motif
     )
+    auc01_iter <- if (validate_each_step) {
+      validate_motif(
+        motif_file      = new_model_csv,
+        validation_file = validation_file,
+        output_dir      = file.path(base_output_dir,
+                                     sprintf("TEMPO_step%d_%s", iter, peptide),
+                                     "validation"),
+        peptide         = peptide, mhc = mhc, plot = FALSE
+      )$auc01
+    } else NA_real_
+
     step_counts[[iter + 1L]] <- data.frame(step    = iter,
                                             n_total = scored_i$n_total,
-                                            n_top   = scored_i$n_top)
+                                            n_top   = scored_i$n_top,
+                                            auc01   = auc01_iter)
     top_tcrs          <- scored_i$top_tcrs
     all_tcrs          <- scored_i$all_tcrs
+    all_tcrs_combined <- rbind(all_tcrs_combined, scored_i$all_tcrs)
     current_model_csv <- new_model_csv
+    last_step         <- iter
+  }
+
+  # ------------------------------------------------------------------
+  # Final motif plots (optimizer mode): top binders from last iteration
+  # plotted against (1) all TCRs from that iteration and (2) standard
+  # MixTCRviz baseline.
+  # ------------------------------------------------------------------
+  if (plot_final_motif && nrow(top_tcrs) >= 10) {
+    final_step_dir <- file.path(base_output_dir,
+                                sprintf("TEMPO_step%d_%s", last_step, peptide))
+    plot_iter_motif(top_tcrs, peptide, last_step,
+                    output_dir = file.path(final_step_dir, "motif_vs_iter"),
+                    all_tcrs   = all_tcrs_combined)
+    plot_iter_motif(top_tcrs, peptide, last_step,
+                    output_dir = file.path(final_step_dir, "motif_vs_baseline"))
   }
 
   # ------------------------------------------------------------------

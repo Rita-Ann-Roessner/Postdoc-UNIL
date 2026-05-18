@@ -45,7 +45,9 @@ objective <- function(pssm_weight, decay_factor) {
         validation_file    = file.path(peptide, "validation.csv"),
         pssm_weight        = pssm_weight,
         decay_factor       = decay_factor,
-        plot_motif         = FALSE
+        plot_motif         = FALSE,
+        plot_final_motif   = TRUE,
+        validate_each_step = TRUE
       ),
       error = function(e) {
         message("  ERROR for ", peptide, ": ", e$message)
@@ -64,7 +66,7 @@ objective <- function(pssm_weight, decay_factor) {
   # build long-format rows: one per peptide × step
   new_rows <- do.call(rbind, lapply(names(dico), function(p) {
     res_p  <- res_list[[p]]
-    data.frame(
+    row <- data.frame(
       run_id       = run_id,
       pssm_weight  = pssm_weight,
       decay_factor = decay_factor,
@@ -73,6 +75,16 @@ objective <- function(pssm_weight, decay_factor) {
       auc01        = auc01_vals[[p]],
       stringsAsFactors = FALSE
     )
+    # add per-step auc01 as wide columns (auc01_step0, auc01_step1, ...)
+    if (!is.null(res_p) && !is.null(res_p$step_counts) &&
+        "auc01" %in% colnames(res_p$step_counts)) {
+      sc <- res_p$step_counts
+      for (i in seq_len(nrow(sc))) {
+        col <- sprintf("auc01_step%d", sc$step[i])
+        row[[col]] <- sc$auc01[i]
+      }
+    }
+    row
   }))
 
   eval_log <<- rbind(eval_log, new_rows)
