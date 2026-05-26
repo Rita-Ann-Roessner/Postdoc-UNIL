@@ -25,11 +25,12 @@ BASE_OUTPUT_DIR <- "."
 SCORE_COL       <- "perc_rank" # lower = better binder (HLA convention)
 N_ITERATIONS    <- 3           # scoring+enrichment steps (steps 1–N); step 0 is always flat random
 N_PAIRS         <- 400         # V/J pairs sampled per chain from top-binder distribution
-N_CDR3_MULTI    <- 5           # CDR3 sequences sampled per V/J pair (iterations > 0)
+N_CDR3_MULTI    <- 1           # CDR3 sequences sampled per V/J pair (iterations > 0)
 INIT_PERC_RANK  <- 10          # threshold for step 0; decays each step by DECAY_FACTOR
 DECAY_FACTOR    <- 0.135         # multiplicative decay per step: step k uses INIT × DECAY^k
 PSSM_WEIGHT     <- 0.643        # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM   <- 30         # minimum high-scorers required before using a PSSM
+LEN_DIST_COND_VJ <- FALSE      # if TRUE, sample CDR3 length | V/J pair; if FALSE, use marginal length dist
 
 dico <- list(
   "LLWNGPMAV"  = "A0201",
@@ -177,21 +178,29 @@ build_cdr3_pssm <- function(cdr3_seqs, pseudocount = 0.1) {
 # =============================================================================
 
 draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
-                                    n          = 5,
-                                    len_dist   = NULL,
-                                    cdr3_pssm  = NULL,
-                                    pssm_weight = 0.5) {
+                                    n              = 5,
+                                    len_dist       = NULL,
+                                    len_dist_vj    = NULL,
+                                    cdr3_pssm      = NULL,
+                                    pssm_weight    = 0.5) {
   key <- paste0(v_seg, "_", j_seg)
   if (!key %in% names(cdr3_baseline[[chain]])) return(character(0))
 
   vj_counts         <- cdr3_baseline[[chain]][[key]]
   lengths_available <- names(vj_counts)
 
-  # (2) Sample n lengths with replacement from enriched distribution
-  if (!is.null(len_dist)) {
-    valid_lens <- intersect(names(len_dist), lengths_available)
+  # (2) Sample n lengths with replacement from enriched distribution.
+  # Priority: VJ-conditioned > marginal > uniform from baseline.
+  active_len_dist <- if (!is.null(len_dist_vj) && key %in% names(len_dist_vj)) {
+    len_dist_vj[[key]]   # P(Length | V, J)
+  } else {
+    len_dist             # P(Length) marginal — or NULL
+  }
+
+  if (!is.null(active_len_dist)) {
+    valid_lens <- intersect(names(active_len_dist), lengths_available)
     if (length(valid_lens) > 0) {
-      probs         <- unlist(len_dist[valid_lens])
+      probs         <- unlist(active_len_dist[valid_lens])
       probs         <- probs / sum(probs)
       selected_lens <- sample(valid_lens, size = n, replace = TRUE, prob = probs)
     } else {
@@ -239,6 +248,7 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
 sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file,
                                      n           = 5,
                                      len_dist    = NULL,
+                                     len_dist_vj = NULL,
                                      cdr3_pssm   = NULL,
                                      pssm_weight = 0.5) {
   df           <- read.csv(pair_file)
@@ -251,6 +261,7 @@ sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file
                     MoreArgs = list(cdr3_baseline = cdr3_baseline,
                                    n           = n,
                                    len_dist    = len_dist,
+                                   len_dist_vj = len_dist_vj,
                                    cdr3_pssm   = cdr3_pssm,
                                    pssm_weight = pssm_weight),
                     SIMPLIFY = FALSE)
@@ -421,6 +432,33 @@ extract_cdr3_len_dist <- function(top_tcrs, chain) {
 }
 
 
+# Per-(V,J) CDR3 length distribution from top binders (conditioned on VJ).
+# Returns a named list keyed by "TRAV_TRAJ" (or "TRBV_TRBJ") strings.
+# Each element is a length-probability list (same format as extract_cdr3_len_dist).
+# Falls back gracefully: callers should use the marginal len_dist when the VJ
+# key is absent (e.g. rare pairs with zero top-binder observations).
+extract_cdr3_len_dist_vj <- function(top_tcrs, chain) {
+  cdr3_col <- paste0("cdr3_TR", chain)
+  v_col    <- paste0("TR", chain, "V")
+  j_col    <- paste0("TR", chain, "J")
+  if (!all(c(cdr3_col, v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
+
+  keep <- !is.na(top_tcrs[[cdr3_col]]) & !is.na(top_tcrs[[v_col]]) &
+          !is.na(top_tcrs[[j_col]])
+  df   <- top_tcrs[keep, ]
+  if (nrow(df) == 0) return(NULL)
+
+  vj_keys <- paste0(df[[v_col]], "_", df[[j_col]])
+  lens    <- paste0("L_", nchar(df[[cdr3_col]]))
+
+  vj_len_dist <- lapply(split(lens, vj_keys), function(l) {
+    tbl <- table(l)
+    as.list(tbl / sum(tbl))
+  })
+  vj_len_dist
+}
+
+
 load_tempo_scores <- function(pred_output_file, model_file, score_col) {
   scores <- read.csv(pred_output_file)
   model  <- read.csv(model_file)
@@ -530,6 +568,8 @@ score_step <- function(predictor_rds, model_csv, threshold,
   message(sprintf("  [Step %d] %d / %d TCRs with %s < %.2f",
                   step, nrow(top_tcrs), nrow(scored_tcrs), score_col, threshold))
 
+  write.csv(top_tcrs, file.path(step_dir, "top_tcrs.csv"), row.names = FALSE)
+
   if (plot_motif && nrow(top_tcrs) >= 10) {
     plot_iter_motif(top_tcrs, peptide, step,
                     output_dir = file.path(step_dir, "motif"),
@@ -557,7 +597,8 @@ enrich_generate_step <- function(top_tcrs,
                                   step, peptide, mhc,
                                   base_output_dir, cdr3_baseline,
                                   n_pairs, n_cdr3_multi,
-                                  pssm_weight, min_tcrs_pssm) {
+                                  pssm_weight, min_tcrs_pssm,
+                                  len_dist_conditioned_on_vj = LEN_DIST_COND_VJ) {
 
   if (nrow(top_tcrs) < 10) {
     warning(sprintf("Too few high-scoring TCRs for step %d enrichment — stopping.", step))
@@ -573,8 +614,18 @@ enrich_generate_step <- function(top_tcrs,
   sample_vj_pairs(vj_dist, "B", n_pairs, step_dir)
 
   # (2) CDR3 length distribution from top binders
-  len_dist_A <- extract_cdr3_len_dist(top_tcrs, "A")
-  len_dist_B <- extract_cdr3_len_dist(top_tcrs, "B")
+  # Either conditioned on V/J pair, or marginal across all top binders.
+  if (len_dist_conditioned_on_vj) {
+    len_dist_A    <- NULL   # not used when conditioning on VJ
+    len_dist_B    <- NULL
+    len_dist_vj_A <- extract_cdr3_len_dist_vj(top_tcrs, "A")
+    len_dist_vj_B <- extract_cdr3_len_dist_vj(top_tcrs, "B")
+  } else {
+    len_dist_A    <- extract_cdr3_len_dist(top_tcrs, "A")
+    len_dist_B    <- extract_cdr3_len_dist(top_tcrs, "B")
+    len_dist_vj_A <- NULL
+    len_dist_vj_B <- NULL
+  }
 
   # (3) PSSM from top binders
   if (nrow(top_tcrs) >= min_tcrs_pssm) {
@@ -591,12 +642,14 @@ enrich_generate_step <- function(top_tcrs,
                           file.path(step_dir, "TRAV_TRAJ.csv"), cdr3_baseline,
                           file.path(step_dir, "TRAV_TRAJ_cdr3.csv"),
                           n = n_cdr3_multi, len_dist = len_dist_A,
+                          len_dist_vj = len_dist_vj_A,
                           cdr3_pssm = pssm_A, pssm_weight = pssm_weight)
 
   sample_chain_cdr3_multi("TRB",
                           file.path(step_dir, "TRBV_TRBJ.csv"), cdr3_baseline,
                           file.path(step_dir, "TRBV_TRBJ_cdr3.csv"),
                           n = n_cdr3_multi, len_dist = len_dist_B,
+                          len_dist_vj = len_dist_vj_B,
                           cdr3_pssm = pssm_B, pssm_weight = pssm_weight)
 
   df_paired <- pair_alpha_beta_multi(
@@ -628,9 +681,10 @@ run_motif_builder <- function(peptide, mhc,
                                pssm_weight      = PSSM_WEIGHT,
                                min_tcrs_pssm    = MIN_TCRS_PSSM,
                                score_col          = SCORE_COL,
-                               plot_motif         = FALSE,
-                               plot_final_motif   = TRUE,
-                               validate_each_step = FALSE) {
+                               plot_motif                 = FALSE,
+                               plot_final_motif           = TRUE,
+                               validate_each_step         = FALSE,
+                               len_dist_conditioned_on_vj = LEN_DIST_COND_VJ) {
 
   step_counts <- list()
 
@@ -715,15 +769,16 @@ run_motif_builder <- function(peptide, mhc,
     message(sprintf("[%s] Step %d / %d: enrichment + generation", peptide, iter, n_iterations))
 
     new_model_csv <- enrich_generate_step(
-      top_tcrs        = top_tcrs,
-      step            = iter,
-      peptide         = peptide, mhc = mhc,
-      base_output_dir = base_output_dir,
-      cdr3_baseline   = cdr3_baseline,
-      n_pairs         = n_pairs,
-      n_cdr3_multi    = n_cdr3_multi,
-      pssm_weight     = pssm_weight,
-      min_tcrs_pssm   = min_tcrs_pssm
+      top_tcrs                   = top_tcrs,
+      step                       = iter,
+      peptide                    = peptide, mhc = mhc,
+      base_output_dir            = base_output_dir,
+      cdr3_baseline              = cdr3_baseline,
+      n_pairs                    = n_pairs,
+      n_cdr3_multi               = n_cdr3_multi,
+      pssm_weight                = pssm_weight,
+      min_tcrs_pssm              = min_tcrs_pssm,
+      len_dist_conditioned_on_vj = len_dist_conditioned_on_vj
     )
     if (is.null(new_model_csv)) break
 
