@@ -30,10 +30,11 @@ for (i in seq_len(nrow(grid))) {
   run_id <- sprintf("npairs%d_ncdr3%d", np, nc)
   message(sprintf("\n===== Grid run %d / %d : %s =====", i, nrow(grid), run_id))
 
-  for (peptide in names(dico)) {
-    mhc     <- dico[[peptide]]
-    out_dir <- file.path(GRID_OUTPUT_DIR, run_id, peptide)
-    message(sprintf("  -> %s / %s", peptide, mhc))
+  for (epitope in epitopes) {
+    mhc     <- sub("_.*", "", epitope)
+    peptide <- sub("^[^_]*_", "", epitope)
+    out_dir <- file.path(GRID_OUTPUT_DIR, run_id, epitope)
+    message(sprintf("  -> %s", epitope))
 
     res <- tryCatch(
       run_motif_builder(
@@ -41,8 +42,8 @@ for (i in seq_len(nrow(grid))) {
         mhc                = mhc,
         base_output_dir    = out_dir,
         cdr3_baseline      = cdr3_baseline,
-        known_binders_file = file.path(peptide, paste0("A0201_", peptide, ".csv")),
-        validation_file    = file.path(peptide, "validation.csv"),
+        known_binders_file = file.path(epitope, paste0(epitope, ".csv")),
+        validation_file    = file.path(epitope, "validation.csv"),
         n_pairs            = np,
         n_cdr3_multi       = nc,
         plot_motif         = FALSE,
@@ -59,7 +60,7 @@ for (i in seq_len(nrow(grid))) {
       run_id       = run_id,
       n_pairs      = np,
       n_cdr3_multi = nc,
-      peptide      = peptide,
+      epitope      = epitope,
       auc          = if (is.null(res)) NA_real_ else res$final_auc,
       auc01        = if (is.null(res)) NA_real_ else res$final_auc01,
       stringsAsFactors = FALSE

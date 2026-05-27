@@ -31,9 +31,10 @@ objective <- function(pssm_weight, decay_factor) {
   message(sprintf("\n>>> Evaluating: %s", run_id))
 
   res_list <- list()
-  auc01_vals <- sapply(names(dico), function(peptide) {
-    mhc     <- dico[[peptide]]
-    out_dir <- file.path(OPTIMIZER_OUTPUT_DIR, run_id, peptide)
+  auc01_vals <- sapply(epitopes, function(epitope) {
+    mhc     <- sub("_.*", "", epitope)
+    peptide <- sub("^[^_]*_", "", epitope)
+    out_dir <- file.path(OPTIMIZER_OUTPUT_DIR, run_id, epitope)
 
     res <- tryCatch(
       run_motif_builder(
@@ -41,8 +42,8 @@ objective <- function(pssm_weight, decay_factor) {
         mhc                = mhc,
         base_output_dir    = out_dir,
         cdr3_baseline      = cdr3_baseline,
-        known_binders_file = file.path(peptide, paste0("A0201_", peptide, ".csv")),
-        validation_file    = file.path(peptide, "validation.csv"),
+        known_binders_file = file.path(epitope, paste0(epitope, ".csv")),
+        validation_file    = file.path(epitope, "validation.csv"),
         pssm_weight        = pssm_weight,
         decay_factor       = decay_factor,
         plot_motif         = FALSE,
@@ -50,12 +51,12 @@ objective <- function(pssm_weight, decay_factor) {
         validate_each_step = TRUE
       ),
       error = function(e) {
-        message("  ERROR for ", peptide, ": ", e$message)
+        message("  ERROR for ", epitope, ": ", e$message)
         NULL
       }
     )
 
-    res_list[[peptide]] <<- res
+    res_list[[epitope]] <<- res
     if (is.null(res)) NA_real_ else res$final_auc01
   })
 
@@ -63,16 +64,16 @@ objective <- function(pssm_weight, decay_factor) {
   message(sprintf("    AUC0.1 per epitope: %s  →  mean = %.4f",
                   paste(sprintf("%.4f", auc01_vals), collapse = ", "), score))
 
-  # build long-format rows: one per peptide × step
-  new_rows <- do.call(rbind, lapply(names(dico), function(p) {
-    res_p  <- res_list[[p]]
+  # build long-format rows: one per epitope
+  new_rows <- do.call(rbind, lapply(epitopes, function(ep) {
+    res_p  <- res_list[[ep]]
     row <- data.frame(
       run_id       = run_id,
       pssm_weight  = pssm_weight,
       decay_factor = decay_factor,
       mean_auc01   = score,
-      peptide      = p,
-      auc01        = auc01_vals[[p]],
+      epitope      = ep,
+      auc01        = auc01_vals[[ep]],
       stringsAsFactors = FALSE
     )
     # add per-step auc01 as wide columns (auc01_step0, auc01_step1, ...)
@@ -85,7 +86,7 @@ objective <- function(pssm_weight, decay_factor) {
       }
     }
     row
-  }))
+  }))  # end lapply over epitopes
 
   eval_log <<- rbind(eval_log, new_rows)
   write.csv(eval_log,

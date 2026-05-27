@@ -25,18 +25,26 @@ BASE_OUTPUT_DIR <- "."
 SCORE_COL       <- "perc_rank" # lower = better binder (HLA convention)
 N_ITERATIONS    <- 3           # scoring+enrichment steps (steps 1–N); step 0 is always flat random
 N_PAIRS         <- 400         # V/J pairs sampled per chain from top-binder distribution
-N_CDR3_MULTI    <- 1           # CDR3 sequences sampled per V/J pair (iterations > 0)
+N_CDR3_MULTI    <- 5           # CDR3 sequences sampled per V/J pair (iterations > 0)
 INIT_PERC_RANK  <- 10          # threshold for step 0; decays each step by DECAY_FACTOR
 DECAY_FACTOR    <- 0.135         # multiplicative decay per step: step k uses INIT × DECAY^k
 PSSM_WEIGHT     <- 0.643        # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM   <- 30         # minimum high-scorers required before using a PSSM
 LEN_DIST_COND_VJ <- FALSE      # if TRUE, sample CDR3 length | V/J pair; if FALSE, use marginal length dist
 
-dico <- list(
-  "LLWNGPMAV"  = "A0201",
-  "ELAGIGILTV" = "A0201",
-  "GILGFVFTL"  = "A0201"
+EPITOPES_FILE <- "epitopes.txt"   # path to a plain-text file with one epitope per line,
+                        # e.g. "epitopes.txt"; set to NULL to use the list below
+epitopes <- c(
+  "A0201_LLWNGPMAV",
+  "A0201_ELAGIGILTV",
+  "A0201_GILGFVFTL"
 )
+
+if (!is.null(EPITOPES_FILE) && file.exists(EPITOPES_FILE)) {
+  epitopes <- trimws(readLines(EPITOPES_FILE))
+  epitopes <- epitopes[nchar(epitopes) > 0]   # drop blank lines
+  message(sprintf("Loaded %d epitopes from: %s", length(epitopes), EPITOPES_FILE))
+}
 
 
 # =============================================================================
@@ -301,7 +309,7 @@ pair_alpha_beta_multi <- function(file_a, file_b, output_file) {
 # Module 4a — MixTCRviz motif plot per iteration
 # =============================================================================
 
-plot_iter_motif <- function(top_tcrs, peptide, iter, output_dir, all_tcrs = NULL) {
+plot_iter_motif <- function(top_tcrs, label, iter, output_dir, all_tcrs = NULL) {
   baseline_label <- if (is.null(all_tcrs)) "standard baseline" else "iter TCRs"
   message(sprintf("  Plotting MixTCRviz motif (iter %d, n_top=%d, baseline=%s)",
                   iter, nrow(top_tcrs), baseline_label))
@@ -310,7 +318,7 @@ plot_iter_motif <- function(top_tcrs, peptide, iter, output_dir, all_tcrs = NULL
     output.path = output_dir,
     plot        = TRUE,
     renormVJ    = TRUE,
-    set.title   = sprintf("%s - iter %d top binders (n=%d)", peptide, iter, nrow(top_tcrs)),
+    set.title   = sprintf("%s - iter %d top binders (n=%d)", label, iter, nrow(top_tcrs)),
     verbose     = 0
   )
   if (!is.null(all_tcrs)) args$input2 <- all_tcrs
@@ -550,11 +558,11 @@ validate_motif <- function(motif_file, validation_file, output_dir,
 # =============================================================================
 
 score_step <- function(predictor_rds, model_csv, threshold,
-                       step, peptide,
+                       step, label,
                        base_output_dir, score_col,
                        plot_motif = TRUE) {
 
-  step_dir <- file.path(base_output_dir, sprintf("TEMPO_step%d_%s", step, peptide))
+  step_dir <- file.path(base_output_dir, label, sprintf("step%d", step))
   dir.create(step_dir, showWarnings = FALSE, recursive = TRUE)
 
   pred_output <- run_tempo_scoring(
@@ -571,7 +579,7 @@ score_step <- function(predictor_rds, model_csv, threshold,
   write.csv(top_tcrs, file.path(step_dir, "top_tcrs.csv"), row.names = FALSE)
 
   if (plot_motif && nrow(top_tcrs) >= 10) {
-    plot_iter_motif(top_tcrs, peptide, step,
+    plot_iter_motif(top_tcrs, label, step,
                     output_dir = file.path(step_dir, "motif"),
                     all_tcrs   = scored_tcrs)
   }
@@ -594,7 +602,7 @@ score_step <- function(predictor_rds, model_csv, threshold,
 # =============================================================================
 
 enrich_generate_step <- function(top_tcrs,
-                                  step, peptide, mhc,
+                                  step, label, peptide, mhc,
                                   base_output_dir, cdr3_baseline,
                                   n_pairs, n_cdr3_multi,
                                   pssm_weight, min_tcrs_pssm,
@@ -605,7 +613,7 @@ enrich_generate_step <- function(top_tcrs,
     return(NULL)
   }
 
-  step_dir <- file.path(base_output_dir, sprintf("TEMPO_step%d_%s", step, peptide))
+  step_dir <- file.path(base_output_dir, label, sprintf("step%d", step))
   dir.create(step_dir, showWarnings = FALSE, recursive = TRUE)
 
   # (1) V/J distribution from top binders → sample n_pairs pairs per chain
@@ -668,6 +676,7 @@ enrich_generate_step <- function(top_tcrs,
 # =============================================================================
 
 run_motif_builder <- function(peptide, mhc,
+                               label            = paste0(mhc, "_", peptide),
                                base_output_dir  = BASE_OUTPUT_DIR,
                                input_dir        = INPUT_DIR,
                                cdr3_baseline,
@@ -680,7 +689,7 @@ run_motif_builder <- function(peptide, mhc,
                                decay_factor     = DECAY_FACTOR,
                                pssm_weight      = PSSM_WEIGHT,
                                min_tcrs_pssm    = MIN_TCRS_PSSM,
-                               score_col          = SCORE_COL,
+                               score_col                  = SCORE_COL,
                                plot_motif                 = FALSE,
                                plot_final_motif           = TRUE,
                                validate_each_step         = FALSE,
@@ -694,21 +703,21 @@ run_motif_builder <- function(peptide, mhc,
   # ------------------------------------------------------------------
   thresholds <- init_perc_rank * decay_factor^(0:n_iterations)
   message(sprintf("[%s] perc_rank schedule: %s",
-                  peptide,
+                  label,
                   paste(sprintf("%.3f", thresholds), collapse = " -> ")))
 
   # ------------------------------------------------------------------
   # Build (or reload) TEMPO predictor once
   # ------------------------------------------------------------------
-  predictor_rds <- file.path(BASE_OUTPUT_DIR, paste0("predictor_", peptide, ".rds"))
+  predictor_rds <- file.path(BASE_OUTPUT_DIR, label, paste0("predictor_", label, ".rds"))
   predictor_rds <- build_tempo_predictor(known_binders_file, predictor_rds)
 
   # ------------------------------------------------------------------
   # Step 0: flat random TCR generation — no priors
   # ------------------------------------------------------------------
-  message(sprintf("\n[%s] Step 0: random TCR generation (flat baseline)", peptide))
+  message(sprintf("\n[%s] Step 0: random TCR generation (flat baseline)", label))
 
-  step0_dir <- file.path(base_output_dir, sprintf("TEMPO_step0_%s", peptide))
+  step0_dir <- file.path(base_output_dir, label, "step0")
   dir.create(step0_dir, showWarnings = FALSE, recursive = TRUE)
 
   generate_vj_pairs("A", input_dir, step0_dir)
@@ -725,13 +734,13 @@ run_motif_builder <- function(peptide, mhc,
   prepare_model_csv(df_paired0, peptide, mhc, file.path(step0_dir, "model.csv"))
 
   # Score step 0
-  message(sprintf("[%s] Step 0: scoring (threshold = %.3f)", peptide, thresholds[1]))
+  message(sprintf("[%s] Step 0: scoring (threshold = %.3f)", label, thresholds[1]))
   scored0 <- score_step(
     predictor_rds   = predictor_rds,
     model_csv       = file.path(step0_dir, "model.csv"),
     threshold       = thresholds[1],
     step            = 0,
-    peptide         = peptide,
+    label           = label,
     base_output_dir = base_output_dir,
     score_col       = score_col,
     plot_motif      = plot_motif
@@ -762,15 +771,16 @@ run_motif_builder <- function(peptide, mhc,
 
     if (nrow(top_tcrs) < 10) {
       warning(sprintf("[%s] Too few top binders after step %d — stopping early.",
-                      peptide, iter - 1L))
+                      label, iter - 1L))
       break
     }
 
-    message(sprintf("[%s] Step %d / %d: enrichment + generation", peptide, iter, n_iterations))
+    message(sprintf("[%s] Step %d / %d: enrichment + generation", label, iter, n_iterations))
 
     new_model_csv <- enrich_generate_step(
       top_tcrs                   = top_tcrs,
       step                       = iter,
+      label                      = label,
       peptide                    = peptide, mhc = mhc,
       base_output_dir            = base_output_dir,
       cdr3_baseline              = cdr3_baseline,
@@ -783,14 +793,14 @@ run_motif_builder <- function(peptide, mhc,
     if (is.null(new_model_csv)) break
 
     message(sprintf("[%s] Step %d / %d: scoring (threshold = %.3f)",
-                    peptide, iter, n_iterations, thresholds[iter + 1]))
+                    label, iter, n_iterations, thresholds[iter + 1]))
 
     scored_i <- score_step(
       predictor_rds   = predictor_rds,
       model_csv       = new_model_csv,
       threshold       = thresholds[iter + 1],
       step            = iter,
-      peptide         = peptide,
+      label           = label,
       base_output_dir = base_output_dir,
       score_col       = score_col,
       plot_motif      = plot_motif
@@ -799,9 +809,8 @@ run_motif_builder <- function(peptide, mhc,
       validate_motif(
         motif_file      = new_model_csv,
         validation_file = validation_file,
-        output_dir      = file.path(base_output_dir,
-                                     sprintf("TEMPO_step%d_%s", iter, peptide),
-                                     "validation"),
+        output_dir      = file.path(base_output_dir, label,
+                                     sprintf("step%d", iter), "validation"),
         peptide         = peptide, mhc = mhc, plot = FALSE
       )$auc01
     } else NA_real_
@@ -823,24 +832,23 @@ run_motif_builder <- function(peptide, mhc,
   # MixTCRviz baseline.
   # ------------------------------------------------------------------
   if (plot_final_motif && nrow(top_tcrs) >= 10) {
-    final_step_dir <- file.path(base_output_dir,
-                                sprintf("TEMPO_step%d_%s", last_step, peptide))
-    plot_iter_motif(top_tcrs, peptide, last_step,
+    final_step_dir <- file.path(base_output_dir, label, sprintf("step%d", last_step))
+    plot_iter_motif(top_tcrs, label, last_step,
                     output_dir = file.path(final_step_dir, "motif_vs_iter"),
                     all_tcrs   = all_tcrs_combined)
-    plot_iter_motif(top_tcrs, peptide, last_step,
+    plot_iter_motif(top_tcrs, label, last_step,
                     output_dir = file.path(final_step_dir, "motif_vs_baseline"))
   }
 
   # ------------------------------------------------------------------
   # Final validation
   # ------------------------------------------------------------------
-  message(sprintf("[%s] Final validation (AUC)", peptide))
+  message(sprintf("[%s] Final validation (AUC)", label))
 
   auc_result <- validate_motif(
     motif_file      = current_model_csv,
     validation_file = validation_file,
-    output_dir      = file.path(base_output_dir, sprintf("TEMPO_validation_%s", peptide)),
+    output_dir      = file.path(base_output_dir, label, "validation"),
     peptide         = peptide, mhc = mhc,
     plot            = plot_motif
   )
@@ -869,25 +877,35 @@ if (.run_pipeline) {
 
   auc_summary <- list()
 
-  for (peptide in names(dico)) {
-    mhc <- dico[[peptide]]
-    message(sprintf("\n========== %s / %s ==========", peptide, mhc))
+  for (epitope in epitopes) {
+    mhc     <- sub("_.*", "", epitope)
+    peptide <- sub("^[^_]*_", "", epitope)
+    message(sprintf("\n========== %s ==========", epitope))
 
     res <- run_motif_builder(
       peptide            = peptide,
       mhc                = mhc,
       cdr3_baseline      = cdr3_baseline,
-      known_binders_file = file.path(peptide, paste0("A0201_", peptide, ".csv")),
-      validation_file    = file.path(peptide, "validation.csv")
+      known_binders_file = file.path(epitope, paste0(epitope, ".csv")),
+      validation_file    = file.path(epitope, "validation.csv")
     )
 
-    auc_summary[[peptide]] <- list(auc = res$final_auc, auc01 = res$final_auc01)
+    auc_summary[[epitope]] <- list(auc = res$final_auc, auc01 = res$final_auc01)
   }
+
+  auc_df <- data.frame(
+    epitope = names(auc_summary),
+    auc     = sapply(auc_summary, `[[`, "auc"),
+    auc01   = sapply(auc_summary, `[[`, "auc01"),
+    row.names = NULL
+  )
+  write.csv(auc_df, file.path(BASE_OUTPUT_DIR, "auc_summary.csv"), row.names = FALSE)
 
   message("\n===== AUC Summary =====")
   for (nm in names(auc_summary)) {
     message(sprintf("  %s: AUC = %.4f  |  AUC0.1 = %.4f",
                     nm, auc_summary[[nm]]$auc, auc_summary[[nm]]$auc01))
   }
+  message(sprintf("  Saved to: %s", file.path(BASE_OUTPUT_DIR, "auc_summary.csv")))
 
 }
