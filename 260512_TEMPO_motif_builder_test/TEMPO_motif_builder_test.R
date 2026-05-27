@@ -21,7 +21,7 @@ library(pROC)
 ### ---- Configuration --------------------------------------------------------
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/HomoSapiens"
-BASE_OUTPUT_DIR <- "."
+BASE_OUTPUT_DIR <- "IMMREP23"
 SCORE_COL       <- "perc_rank" # lower = better binder (HLA convention)
 N_ITERATIONS    <- 3           # scoring+enrichment steps (steps 1–N); step 0 is always flat random
 N_PAIRS         <- 400         # V/J pairs sampled per chain from top-binder distribution
@@ -32,7 +32,7 @@ PSSM_WEIGHT     <- 0.643        # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM   <- 30         # minimum high-scorers required before using a PSSM
 LEN_DIST_COND_VJ <- FALSE      # if TRUE, sample CDR3 length | V/J pair; if FALSE, use marginal length dist
 
-EPITOPES_FILE <- "epitopes.txt"   # path to a plain-text file with one epitope per line,
+EPITOPES_FILE <- "IMMREP23/epitopes.txt"   # path to a plain-text file with one epitope per line,
                         # e.g. "epitopes.txt"; set to NULL to use the list below
 epitopes <- c(
   "A0201_LLWNGPMAV",
@@ -133,7 +133,6 @@ prepare_model_csv <- function(df_paired, peptide, mhc, output_file) {
   df$model   <- paste0(mhc, "_", peptide)
   df$peptide <- peptide
   df$MHC     <- mhc
-  df$species <- "HomoSapiens"
   write.csv(df, output_file, row.names = FALSE)
   df
 }
@@ -886,8 +885,8 @@ if (.run_pipeline) {
       peptide            = peptide,
       mhc                = mhc,
       cdr3_baseline      = cdr3_baseline,
-      known_binders_file = file.path(epitope, paste0(epitope, ".csv")),
-      validation_file    = file.path(epitope, "validation.csv")
+      known_binders_file = file.path(BASE_OUTPUT_DIR, epitope, paste0(epitope, ".csv")),
+      validation_file    = file.path(BASE_OUTPUT_DIR, epitope, "validation.csv")
     )
 
     auc_summary[[epitope]] <- list(auc = res$final_auc, auc01 = res$final_auc01)

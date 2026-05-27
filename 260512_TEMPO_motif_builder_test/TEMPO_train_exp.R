@@ -1,5 +1,4 @@
 library(TEMPOtrain)
-library(MixTCRviz)
 library(pROC)
 
 # =============================================================================
@@ -8,7 +7,9 @@ library(pROC)
 # AUC / AUC0.1 are computed per epitope and saved to auc_summary_exp.csv.
 # =============================================================================
 
-EPITOPES_FILE <- "epitopes.txt"
+BASE_OUTPUT_DIR <- "IMMREP23"        # set to e.g. "IMMREP23" to run on a different dataset
+EPITOPES_FILE   <- "IMMREP23/epitopes.txt"
+
 epitopes <- trimws(readLines(EPITOPES_FILE))
 epitopes <- epitopes[nchar(epitopes) > 0]
 
@@ -16,9 +17,9 @@ auc_summary <- data.frame()
 
 for (epitope in epitopes) {
 
-  known_binders_file <- file.path(epitope, paste0(epitope, ".csv"))
-  validation_file    <- file.path(epitope, "validation.csv")
-  output_dir         <- epitope
+  known_binders_file <- file.path(BASE_OUTPUT_DIR, epitope, paste0(epitope, ".csv"))
+  validation_file    <- file.path(BASE_OUTPUT_DIR, epitope, "validation.csv")
+  output_dir         <- file.path(BASE_OUTPUT_DIR, epitope)
 
   if (!file.exists(known_binders_file)) {
     message(sprintf("Skipping %s — known binders file not found", epitope))
@@ -78,11 +79,12 @@ for (epitope in epitopes) {
   })
 }
 
-write.csv(auc_summary, "auc_summary_exp.csv", row.names = FALSE)
+out_file <- file.path(BASE_OUTPUT_DIR, "auc_summary_exp.csv")
+write.csv(auc_summary, out_file, row.names = FALSE)
 
 message("\n===== AUC Summary (experimental) =====")
 for (i in seq_len(nrow(auc_summary))) {
   message(sprintf("  %s: AUC = %.4f  |  AUC0.1 = %.4f",
                   auc_summary$epitope[i], auc_summary$auc[i], auc_summary$auc01[i]))
 }
-message(sprintf("  Saved to: auc_summary_exp.csv"))
+message(sprintf("  Saved to: %s", out_file))

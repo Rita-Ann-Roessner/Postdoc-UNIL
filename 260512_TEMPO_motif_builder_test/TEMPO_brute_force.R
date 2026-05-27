@@ -17,7 +17,7 @@ library(pROC)
 .sourced_by_optimizer <- TRUE
 source("TEMPO_motif_builder_test.R", local = FALSE)
 
-BRUTE_OUTPUT_DIR <- "brute_force_runs_small" # "brute_force_runs"
+BRUTE_OUTPUT_DIR <- "IMMREP23/brute_force_runs_small" # "brute_force_runs"
 N_RANDOM         <- 8267 #1e6    # random TCRs to generate
 TOP_PERC         <- 0.001  # top fraction to keep (0.001 = 0.1%)
 
@@ -109,7 +109,6 @@ if (file.exists(random_csv)) {
 
   random_tcrs        <- cbind(df_A, df_B)
   random_tcrs$id     <- seq_len(nrow(random_tcrs))
-  random_tcrs$species <- "HomoSapiens"
 
   write.csv(random_tcrs, random_csv, row.names = FALSE)
   message(sprintf("  Saved %s paired TCRs to: %s",
@@ -131,13 +130,13 @@ for (epitope in epitopes) {
   epitope_dir   <- file.path(BRUTE_OUTPUT_DIR, epitope)
   dir.create(epitope_dir, showWarnings = FALSE, recursive = TRUE)
 
-  predictor_rds   <- file.path(epitope, paste0("predictor_", epitope, ".rds"))
-  validation_file <- file.path(epitope, "validation.csv")
+  predictor_rds   <- file.path(BASE_OUTPUT_DIR, epitope, paste0("predictor_", epitope, ".rds"))
+  validation_file <- file.path(BASE_OUTPUT_DIR, epitope, "validation.csv")
 
   if (!file.exists(predictor_rds)) {
     message(sprintf("  Predictor not found — building from %s/%s.csv", epitope, epitope))
     predictor_rds <- build_tempo_predictor(
-      file.path(epitope, paste0(epitope, ".csv")), predictor_rds
+      file.path(BASE_OUTPUT_DIR, epitope, paste0(epitope, ".csv")), predictor_rds
     )
   }
 
@@ -196,9 +195,6 @@ for (epitope in epitopes) {
   })
 }
 
-# Copy summary to working directory for easy access
-file.copy(file.path(BRUTE_OUTPUT_DIR, "auc_summary_brute.csv"),
-          "auc_summary_brute.csv", overwrite = TRUE)
 
 message("\n===== Brute-force AUC Summary =====")
 for (i in seq_len(nrow(auc_summary))) {
