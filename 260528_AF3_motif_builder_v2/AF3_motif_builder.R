@@ -15,8 +15,8 @@ library(pROC)
 #              → model_alpha.csv (real α + dummy β)
 #              → model_beta.csv  (dummy α + real β)
 #              → Run AF3 on cluster; place results as:
-#                  step0/af3_scores_alpha.txt
-#                  step0/af3_scores_beta.txt
+#                  step0/model_alpha_output.txt
+#                  step0/model_beta_output.txt
 #   Steps 1–N: Load AF3 scores → filter (AF3_iptm_pair_mean >= threshold)
 #              → enrich V/J + CDR3 length + PSSM per chain
 #              → generate new batches → run AF3 on cluster
@@ -31,7 +31,7 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 0         # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 1         # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 3         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/HomoSapiens"
@@ -42,10 +42,13 @@ SCORE_COL       <- "AF3_iptm_pair_mean"   # column in af3_scores_*.txt; higher =
 AF3_THRESHOLDS  <- c(0.5, 0.8, 0.8)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
-N_CDR3_MULTI     <- 5      # CDR3 sequences sampled per V/J pair (enrichment steps)
+N_CDR3_MULTI     <- 1      # CDR3 sequences sampled per V/J pair (enrichment steps)
 PSSM_WEIGHT      <- 0.643  # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
 LEN_DIST_COND_VJ <- FALSE  # if TRUE, sample CDR3 length | V/J; if FALSE, use marginal
+
+PLOT_EACH_STEP     <- TRUE   # if TRUE, plot MixTCRviz motif after each enrichment step
+VALIDATE_EACH_STEP <- TRUE  # if TRUE, run TEMPO validation after each enrichment step
 
 EPITOPES_FILE <- NULL #"epitopes.txt"   # one "MHC_PEPTIDE" label per line, e.g. "A0201_ELAGIGILTV"
 epitopes <- c("A0201_LLWNGPMAV", "A0201_GILGFVFTL")
@@ -421,6 +424,49 @@ validate_motif <- function(motif_file, validation_file, output_dir,
 
 
 # =============================================================================
+# Module 7 — Per-step motif plot and validation helpers
+# =============================================================================
+
+# Plot a MixTCRviz motif for one chain's top binders vs all scored TCRs.
+plot_step_motif <- function(top_tcrs, all_tcrs, chain_letter, label, step, step_dir) {
+  chain_name <- if (chain_letter == "A") "alpha" else "beta"
+  out_dir    <- file.path(step_dir, sprintf("motif_%s", chain_name))
+  n_top      <- nrow(top_tcrs)
+  message(sprintf("  Plotting motif (step %d, chain %s, n_top=%d)", step, chain_letter, n_top))
+  MixTCRviz(
+    input1      = top_tcrs,
+    input2      = all_tcrs,
+    output.path = out_dir,
+    plot        = TRUE,
+    renormVJ    = TRUE,
+    set.title   = sprintf("%s - step %d %s top binders (n=%d)", label, step, chain_name, n_top),
+    verbose     = 0
+  )
+}
+
+
+# Combine alpha and beta top binders into a single TEMPO training df,
+# clearing the dummy-chain columns in each.
+build_motif_df <- function(top_alpha, top_beta, model_label) {
+  motif_rows <- list()
+  if (!is.null(top_alpha) && nrow(top_alpha) > 0) {
+    df_a <- top_alpha[, c("TRAV", "TRAJ", "cdr3_TRA", "TRBV", "TRBJ", "cdr3_TRB"), drop = FALSE]
+    df_a$TRBV <- df_a$TRBJ <- df_a$cdr3_TRB <- NA_character_
+    df_a$model <- model_label
+    motif_rows[["alpha"]] <- df_a
+  }
+  if (!is.null(top_beta) && nrow(top_beta) > 0) {
+    df_b <- top_beta[, c("TRAV", "TRAJ", "cdr3_TRA", "TRBV", "TRBJ", "cdr3_TRB"), drop = FALSE]
+    df_b$TRAV <- df_b$TRAJ <- df_b$cdr3_TRA <- NA_character_
+    df_b$model <- model_label
+    motif_rows[["beta"]] <- df_b
+  }
+  if (length(motif_rows) == 0) return(NULL)
+  do.call(rbind, motif_rows)
+}
+
+
+# =============================================================================
 # Step-level pipeline functions
 # =============================================================================
 
@@ -454,8 +500,8 @@ run_step0 <- function(peptide, mhc_allele, label, cdr3_baseline,
   message(sprintf("[%s] Step 0 done: %d alpha-batch TCRs, %d beta-batch TCRs.", label, n_alpha, n_beta))
   message(sprintf("[%s] → Run AF3 on cluster, then place results as:\n  %s\n  %s",
                   label,
-                  file.path(step_dir, "af3_scores_alpha.txt"),
-                  file.path(step_dir, "af3_scores_beta.txt")))
+                  file.path(step_dir, "model_alpha_output.txt"),
+                  file.path(step_dir, "model_beta_output.txt")))
 
   invisible(step_dir)
 }
@@ -473,8 +519,8 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   step_dir      <- file.path(base_output_dir, label, sprintf("step%d", step))
   dir.create(step_dir, showWarnings = FALSE, recursive = TRUE)
 
-  scores_file <- file.path(prev_step_dir, sprintf("af3_scores_%s.txt", chain_name))
-  model_file  <- file.path(prev_step_dir, sprintf("model_%s.csv",     chain_name))
+  scores_file <- file.path(prev_step_dir, sprintf("model_%s_output.txt", chain_name))
+  model_file  <- file.path(prev_step_dir, sprintf("model_%s.csv",        chain_name))
 
   if (!file.exists(scores_file))
     stop(sprintf("[%s] AF3 scores file missing: %s\nRun AF3 on the cluster first.", label, scores_file))
@@ -532,7 +578,7 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
     pair_with_dummy_alpha(df_chain, peptide, mhc_allele, species, model_out)
   }
 
-  top_tcrs
+  list(top_tcrs = top_tcrs, scored = scored)
 }
 
 
@@ -540,26 +586,58 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
                              cdr3_baseline, base_output_dir,
                              n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
                              af3_thresholds, species = "HomoSapiens",
-                             len_dist_conditioned_on_vj = LEN_DIST_COND_VJ) {
+                             len_dist_conditioned_on_vj = LEN_DIST_COND_VJ,
+                             plot_each_step     = PLOT_EACH_STEP,
+                             validate_each_step = VALIDATE_EACH_STEP,
+                             validation_file    = NULL, mhc = NULL) {
 
   threshold <- af3_thresholds[step]
   message(sprintf("[%s] Step %d: enrichment + generation (threshold = %.2f)", label, step, threshold))
 
-  top_alpha <- enrich_one_chain("A", step, label, peptide, mhc_allele, species,
+  res_alpha <- enrich_one_chain("A", step, label, peptide, mhc_allele, species,
                                  base_output_dir, cdr3_baseline,
                                  n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
                                  threshold, len_dist_conditioned_on_vj)
-  top_beta  <- enrich_one_chain("B", step, label, peptide, mhc_allele, species,
+  res_beta  <- enrich_one_chain("B", step, label, peptide, mhc_allele, species,
                                  base_output_dir, cdr3_baseline,
                                  n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
                                  threshold, len_dist_conditioned_on_vj)
 
+  top_alpha <- res_alpha$top_tcrs
+  top_beta  <- res_beta$top_tcrs
+
   step_dir <- file.path(base_output_dir, label, sprintf("step%d", step))
+
+  # Optional: MixTCRviz motif plots (alpha and beta separately)
+  if (plot_each_step) {
+    if (!is.null(top_alpha) && nrow(top_alpha) >= 10)
+      plot_step_motif(top_alpha, res_alpha$scored, "A", label, step, step_dir)
+    if (!is.null(top_beta) && nrow(top_beta) >= 10)
+      plot_step_motif(top_beta, res_beta$scored, "B", label, step, step_dir)
+  }
+
+  # Optional: TEMPO validation on combined alpha + beta top binders
+  if (validate_each_step && !is.null(validation_file) && !is.null(mhc)) {
+    model_label <- paste0(mhc, "_", peptide)
+    motif_df    <- build_motif_df(top_alpha, top_beta, model_label)
+    if (!is.null(motif_df)) {
+      motif_file <- file.path(step_dir, "motif_top_binders.csv")
+      write.csv(motif_df, motif_file, row.names = FALSE)
+      validate_motif(
+        motif_file      = motif_file,
+        validation_file = validation_file,
+        output_dir      = file.path(step_dir, "validation"),
+        peptide         = peptide,
+        mhc             = mhc
+      )
+    }
+  }
+
   message(sprintf("[%s] Step %d done.", label, step))
   message(sprintf("[%s] → Run AF3 on cluster, then place results as:\n  %s\n  %s",
                   label,
-                  file.path(step_dir, "af3_scores_alpha.txt"),
-                  file.path(step_dir, "af3_scores_beta.txt")))
+                  file.path(step_dir, "model_alpha_output.txt"),
+                  file.path(step_dir, "model_beta_output.txt")))
 
   invisible(list(top_alpha = top_alpha, top_beta = top_beta))
 }
@@ -576,8 +654,8 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
 
   collect_top <- function(chain_letter) {
     chain_name  <- if (chain_letter == "A") "alpha" else "beta"
-    scores_file <- file.path(last_step_dir, sprintf("af3_scores_%s.txt", chain_name))
-    model_file  <- file.path(last_step_dir, sprintf("model_%s.csv",     chain_name))
+    scores_file <- file.path(last_step_dir, sprintf("model_%s_output.txt", chain_name))
+    model_file  <- file.path(last_step_dir, sprintf("model_%s.csv",        chain_name))
     if (!file.exists(scores_file)) {
       warning(sprintf("[%s] AF3 scores file missing: %s — skipping chain %s.",
                       label, scores_file, chain_letter))
@@ -594,31 +672,13 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
   top_alpha <- collect_top("A")
   top_beta  <- collect_top("B")
 
-  # Build TEMPO training file from top binders.
-  # Alpha rows: keep real TRA columns, clear dummy TRB columns.
-  # Beta rows:  keep real TRB columns, clear dummy TRA columns.
   model_label <- paste0(mhc, "_", peptide)
-  motif_rows  <- list()
+  motif_df    <- build_motif_df(top_alpha, top_beta, model_label)
 
-  if (!is.null(top_alpha) && nrow(top_alpha) > 0) {
-    df_a <- top_alpha[, c("TRAV", "TRAJ", "cdr3_TRA", "TRBV", "TRBJ", "cdr3_TRB"), drop = FALSE]
-    df_a$TRBV <- df_a$TRBJ <- df_a$cdr3_TRB <- NA_character_
-    df_a$model <- model_label
-    motif_rows[["alpha"]] <- df_a
-  }
-  if (!is.null(top_beta) && nrow(top_beta) > 0) {
-    df_b <- top_beta[, c("TRAV", "TRAJ", "cdr3_TRA", "TRBV", "TRBJ", "cdr3_TRB"), drop = FALSE]
-    df_b$TRAV <- df_b$TRAJ <- df_b$cdr3_TRA <- NA_character_
-    df_b$model <- model_label
-    motif_rows[["beta"]] <- df_b
-  }
-
-  if (length(motif_rows) == 0) {
+  if (is.null(motif_df)) {
     warning(sprintf("[%s] No top binders found — cannot run TEMPO validation.", label))
     return(NULL)
   }
-
-  motif_df   <- do.call(rbind, motif_rows)
   motif_file <- file.path(base_output_dir, label, "motif_top_binders.csv")
   write.csv(motif_df, motif_file, row.names = FALSE)
   message(sprintf("[%s] Motif training set: %d TCRs written to %s",
@@ -679,7 +739,11 @@ for (epitope in epitopes) {
       pssm_weight                = PSSM_WEIGHT,
       min_tcrs_pssm              = MIN_TCRS_PSSM,
       af3_thresholds             = AF3_THRESHOLDS,
-      len_dist_conditioned_on_vj = LEN_DIST_COND_VJ
+      len_dist_conditioned_on_vj = LEN_DIST_COND_VJ,
+      plot_each_step             = PLOT_EACH_STEP,
+      validate_each_step         = VALIDATE_EACH_STEP,
+      validation_file            = file.path(BASE_OUTPUT_DIR, label, "validation.csv"),
+      mhc                        = mhc
     )
 
   } else if (identical(STEP, "final")) {
