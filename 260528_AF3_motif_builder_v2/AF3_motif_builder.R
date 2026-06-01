@@ -31,7 +31,7 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 1         # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 2         # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 3         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/HomoSapiens"
@@ -39,7 +39,7 @@ BASE_OUTPUT_DIR <- "TCR_motif_atlas"
 SCORE_COL       <- "AF3_iptm_pair_mean"   # column in af3_scores_*.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
-AF3_THRESHOLDS  <- c(0.5, 0.8, 0.8)
+AF3_THRESHOLDS  <- c(0.5, 0.5, 0.8)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 1      # CDR3 sequences sampled per V/J pair (enrichment steps)
@@ -289,7 +289,7 @@ sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file
 
 load_af3_scores <- function(scores_file, model_file, score_col = SCORE_COL) {
   scores <- read.table(scores_file, header = TRUE, sep = "\t")
-  model  <- read.csv(model_file)
+  model  <- read.table(model_file,  header = TRUE, sep = "\t")
 
   if (!score_col %in% colnames(scores))
     stop("Column '", score_col, "' not found in AF3 scores file.\n",
@@ -520,10 +520,12 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   dir.create(step_dir, showWarnings = FALSE, recursive = TRUE)
 
   scores_file <- file.path(prev_step_dir, sprintf("model_%s_output.txt", chain_name))
-  model_file  <- file.path(prev_step_dir, sprintf("model_%s.csv",        chain_name))
+  model_file  <- file.path(prev_step_dir, sprintf("model_%s_input.txt",  chain_name))
 
   if (!file.exists(scores_file))
     stop(sprintf("[%s] AF3 scores file missing: %s\nRun AF3 on the cluster first.", label, scores_file))
+  if (!file.exists(model_file))
+    stop(sprintf("[%s] Model input file missing: %s\nThis file is produced by Script_build_struct_inputs_mod.R on the cluster.", label, model_file))
 
   scored   <- load_af3_scores(scores_file, model_file)
   top_tcrs <- scored[scored[[SCORE_COL]] >= threshold, ]
@@ -570,8 +572,8 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
                            n = n_cdr3_multi, len_dist = len_dist, len_dist_vj = len_dist_vj,
                            cdr3_pssm = cdr3_pssm, pssm_weight = pssm_weight)
 
-  df_chain   <- read.csv(cdr3_file)
-  model_out  <- file.path(step_dir, sprintf("model_%s.csv", chain_name))
+  df_chain  <- read.csv(cdr3_file)
+  model_out <- file.path(step_dir, sprintf("model_%s.csv", chain_name))
   if (chain_letter == "A") {
     pair_with_dummy_beta(df_chain, peptide, mhc_allele, species, model_out)
   } else {
@@ -591,7 +593,10 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
                              validate_each_step = VALIDATE_EACH_STEP,
                              validation_file    = NULL, mhc = NULL) {
 
-  threshold <- af3_thresholds[step]
+  threshold     <- af3_thresholds[step]
+  prev_step_dir <- file.path(base_output_dir, label, sprintf("step%d", step - 1))
+  step_dir      <- file.path(base_output_dir, label, sprintf("step%d", step))
+
   message(sprintf("[%s] Step %d: enrichment + generation (threshold = %.2f)", label, step, threshold))
 
   res_alpha <- enrich_one_chain("A", step, label, peptide, mhc_allele, species,
@@ -606,31 +611,32 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
   top_alpha <- res_alpha$top_tcrs
   top_beta  <- res_beta$top_tcrs
 
-  step_dir <- file.path(base_output_dir, label, sprintf("step%d", step))
-
-  # Optional: MixTCRviz motif plots (alpha and beta separately)
+  # Optional: MixTCRviz motif plots — saved into prev_step_dir (scores source)
   if (plot_each_step) {
     if (!is.null(top_alpha) && nrow(top_alpha) >= 10)
-      plot_step_motif(top_alpha, res_alpha$scored, "A", label, step, step_dir)
+      plot_step_motif(top_alpha, res_alpha$scored, "A", label, step - 1, prev_step_dir)
     if (!is.null(top_beta) && nrow(top_beta) >= 10)
-      plot_step_motif(top_beta, res_beta$scored, "B", label, step, step_dir)
+      plot_step_motif(top_beta, res_beta$scored, "B", label, step - 1, prev_step_dir)
   }
 
-  # Optional: TEMPO validation on combined alpha + beta top binders
-  if (validate_each_step && !is.null(validation_file) && !is.null(mhc)) {
-    model_label <- paste0(mhc, "_", peptide)
-    motif_df    <- build_motif_df(top_alpha, top_beta, model_label)
-    if (!is.null(motif_df)) {
-      motif_file <- file.path(step_dir, "motif_top_binders.csv")
-      write.csv(motif_df, motif_file, row.names = FALSE)
-      validate_motif(
-        motif_file      = motif_file,
-        validation_file = validation_file,
-        output_dir      = file.path(step_dir, "validation"),
-        peptide         = peptide,
-        mhc             = mhc
-      )
-    }
+  # Always write the combined top-binder motif file into prev_step_dir
+  model_label <- paste0(mhc, "_", peptide)
+  motif_df    <- build_motif_df(top_alpha, top_beta, model_label)
+  motif_file  <- NULL
+  if (!is.null(motif_df)) {
+    motif_file <- file.path(prev_step_dir, "motif_top_binders.csv")
+    write.csv(motif_df, motif_file, row.names = FALSE)
+  }
+
+  # Optional: TEMPO validation — saved into prev_step_dir (scores source)
+  if (validate_each_step && !is.null(motif_file) && !is.null(validation_file) && !is.null(mhc)) {
+    validate_motif(
+      motif_file      = motif_file,
+      validation_file = validation_file,
+      output_dir      = file.path(prev_step_dir, "validation"),
+      peptide         = peptide,
+      mhc             = mhc
+    )
   }
 
   message(sprintf("[%s] Step %d done.", label, step))
@@ -655,7 +661,7 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
   collect_top <- function(chain_letter) {
     chain_name  <- if (chain_letter == "A") "alpha" else "beta"
     scores_file <- file.path(last_step_dir, sprintf("model_%s_output.txt", chain_name))
-    model_file  <- file.path(last_step_dir, sprintf("model_%s.csv",        chain_name))
+    model_file  <- file.path(last_step_dir, sprintf("model_%s_input.txt",  chain_name))
     if (!file.exists(scores_file)) {
       warning(sprintf("[%s] AF3 scores file missing: %s — skipping chain %s.",
                       label, scores_file, chain_letter))
