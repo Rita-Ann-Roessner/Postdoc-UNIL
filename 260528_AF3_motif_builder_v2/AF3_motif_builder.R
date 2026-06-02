@@ -24,22 +24,23 @@ library(pROC)
 #              (dummy chain columns cleared) → AUC / AUC0.1 validation
 #
 # Usage: set STEP before sourcing / running this script.
-#   STEP = 0           → generate step-0 TCR batches
-#   STEP = 1 .. N_STEPS→ enrich from step (STEP-1) AF3 scores; generate new batch
-#   STEP = "final"     → TEMPO validation using step N_STEPS AF3 scores
+#   STEP = 0              → generate step-0 TCR batches
+#   STEP = 1 .. N_STEPS   → enrich from step (STEP-1) AF3 scores; generate new batch
+#   STEP = c(1, 2, 3)     → run multiple enrichment steps in sequence
+#   STEP = "final"        → TEMPO validation using step N_STEPS AF3 scores
 # =============================================================================
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 2         # 0, 1, ..., N_STEPS, or "final"
-N_STEPS         <- 3         # total number of enrichment steps after step 0
+STEP            <- c(1, 2)        # 0, 1, ..., N_STEPS, or "final"
+N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/HomoSapiens"
 BASE_OUTPUT_DIR <- "TCR_motif_atlas"
 SCORE_COL       <- "AF3_iptm_pair_mean"   # column in af3_scores_*.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
-AF3_THRESHOLDS  <- c(0.5, 0.5, 0.8)
+AF3_THRESHOLDS  <- c(0.5, 0.6)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 1      # CDR3 sequences sampled per V/J pair (enrichment steps)
@@ -427,15 +428,14 @@ validate_motif <- function(motif_file, validation_file, output_dir,
 # Module 7 — Per-step motif plot and validation helpers
 # =============================================================================
 
-# Plot a MixTCRviz motif for one chain's top binders vs all scored TCRs.
-plot_step_motif <- function(top_tcrs, all_tcrs, chain_letter, label, step, step_dir) {
+# Plot a MixTCRviz motif for one chain's top binders vs the default baseline.
+plot_step_motif <- function(top_tcrs, chain_letter, label, step, step_dir) {
   chain_name <- if (chain_letter == "A") "alpha" else "beta"
   out_dir    <- file.path(step_dir, sprintf("motif_%s", chain_name))
   n_top      <- nrow(top_tcrs)
   message(sprintf("  Plotting motif (step %d, chain %s, n_top=%d)", step, chain_letter, n_top))
   MixTCRviz(
     input1      = top_tcrs,
-    input2      = all_tcrs,
     output.path = out_dir,
     plot        = TRUE,
     renormVJ    = TRUE,
@@ -580,7 +580,7 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
     pair_with_dummy_alpha(df_chain, peptide, mhc_allele, species, model_out)
   }
 
-  list(top_tcrs = top_tcrs, scored = scored)
+  top_tcrs
 }
 
 
@@ -599,24 +599,21 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
 
   message(sprintf("[%s] Step %d: enrichment + generation (threshold = %.2f)", label, step, threshold))
 
-  res_alpha <- enrich_one_chain("A", step, label, peptide, mhc_allele, species,
-                                 base_output_dir, cdr3_baseline,
-                                 n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
-                                 threshold, len_dist_conditioned_on_vj)
-  res_beta  <- enrich_one_chain("B", step, label, peptide, mhc_allele, species,
-                                 base_output_dir, cdr3_baseline,
-                                 n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
-                                 threshold, len_dist_conditioned_on_vj)
-
-  top_alpha <- res_alpha$top_tcrs
-  top_beta  <- res_beta$top_tcrs
+  top_alpha <- enrich_one_chain("A", step, label, peptide, mhc_allele, species,
+                                base_output_dir, cdr3_baseline,
+                                n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
+                                threshold, len_dist_conditioned_on_vj)
+  top_beta  <- enrich_one_chain("B", step, label, peptide, mhc_allele, species,
+                                base_output_dir, cdr3_baseline,
+                                n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
+                                threshold, len_dist_conditioned_on_vj)
 
   # Optional: MixTCRviz motif plots — saved into prev_step_dir (scores source)
   if (plot_each_step) {
     if (!is.null(top_alpha) && nrow(top_alpha) >= 10)
-      plot_step_motif(top_alpha, res_alpha$scored, "A", label, step - 1, prev_step_dir)
+      plot_step_motif(top_alpha, "A", label, step - 1, prev_step_dir)
     if (!is.null(top_beta) && nrow(top_beta) >= 10)
-      plot_step_motif(top_beta, res_beta$scored, "B", label, step - 1, prev_step_dir)
+      plot_step_motif(top_beta, "B", label, step - 1, prev_step_dir)
   }
 
   # Always write the combined top-binder motif file into prev_step_dir
@@ -731,26 +728,28 @@ for (epitope in epitopes) {
       input_dir       = INPUT_DIR
     )
 
-  } else if (is.numeric(STEP) && STEP >= 1 && STEP <= N_STEPS) {
+  } else if (is.numeric(STEP) && all(STEP >= 1 & STEP <= N_STEPS)) {
 
-    run_enrich_step(
-      step                       = STEP,
-      peptide                    = peptide,
-      mhc_allele                 = mhc_allele,
-      label                      = label,
-      cdr3_baseline              = cdr3_baseline,
-      base_output_dir            = BASE_OUTPUT_DIR,
-      n_pairs                    = N_PAIRS,
-      n_cdr3_multi               = N_CDR3_MULTI,
-      pssm_weight                = PSSM_WEIGHT,
-      min_tcrs_pssm              = MIN_TCRS_PSSM,
-      af3_thresholds             = AF3_THRESHOLDS,
-      len_dist_conditioned_on_vj = LEN_DIST_COND_VJ,
-      plot_each_step             = PLOT_EACH_STEP,
-      validate_each_step         = VALIDATE_EACH_STEP,
-      validation_file            = file.path(BASE_OUTPUT_DIR, label, "validation.csv"),
-      mhc                        = mhc
-    )
+    for (s in sort(unique(STEP))) {
+      run_enrich_step(
+        step                       = s,
+        peptide                    = peptide,
+        mhc_allele                 = mhc_allele,
+        label                      = label,
+        cdr3_baseline              = cdr3_baseline,
+        base_output_dir            = BASE_OUTPUT_DIR,
+        n_pairs                    = N_PAIRS,
+        n_cdr3_multi               = N_CDR3_MULTI,
+        pssm_weight                = PSSM_WEIGHT,
+        min_tcrs_pssm              = MIN_TCRS_PSSM,
+        af3_thresholds             = AF3_THRESHOLDS,
+        len_dist_conditioned_on_vj = LEN_DIST_COND_VJ,
+        plot_each_step             = PLOT_EACH_STEP,
+        validate_each_step         = VALIDATE_EACH_STEP,
+        validation_file            = file.path(BASE_OUTPUT_DIR, label, "validation.csv"),
+        mhc                        = mhc
+      )
+    }
 
   } else if (identical(STEP, "final")) {
 
