@@ -32,7 +32,7 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- c(1, 2)        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 1 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/HomoSapiens"
@@ -40,10 +40,10 @@ BASE_OUTPUT_DIR <- "TCR_motif_atlas"
 SCORE_COL       <- "AF3_iptm_pair_mean"   # column in af3_scores_*.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
-AF3_THRESHOLDS  <- c(0.5, 0.6)
+AF3_THRESHOLDS  <- c(0.5)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
-N_CDR3_MULTI     <- 1      # CDR3 sequences sampled per V/J pair (enrichment steps)
+N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
 PSSM_WEIGHT      <- 0.643  # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
 LEN_DIST_COND_VJ <- FALSE  # if TRUE, sample CDR3 length | V/J; if FALSE, use marginal
@@ -217,7 +217,8 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
     if (length(valid_lens) > 0) {
       probs         <- unlist(active_len_dist[valid_lens])
       probs         <- probs / sum(probs)
-      selected_lens <- sample(valid_lens, size = n, replace = TRUE, prob = probs)
+      selected_lens <- sample(valid_lens, size = min(n, length(valid_lens)),
+                              replace = FALSE, prob = probs)
     } else {
       selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
     }
@@ -339,30 +340,60 @@ sample_vj_pairs <- function(vj_dist, chain_letter, n_pairs, output_dir) {
 }
 
 
-extract_cdr3_len_dist <- function(top_tcrs, chain_letter) {
+extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter) {
   cdr3_col <- paste0("cdr3_TR", chain_letter)
   if (!cdr3_col %in% colnames(top_tcrs)) return(NULL)
-  lens <- nchar(top_tcrs[[cdr3_col]])
-  lens <- lens[!is.na(lens) & lens > 0]
-  if (length(lens) == 0) return(NULL)
-  tbl  <- table(paste0("L_", lens))
-  as.list(tbl / sum(tbl))
+
+  freq_top <- table(paste0("L_", nchar(top_tcrs[[cdr3_col]][!is.na(top_tcrs[[cdr3_col]])])))
+  freq_all <- table(paste0("L_", nchar(scored[[cdr3_col]][!is.na(scored[[cdr3_col]])])))
+  if (sum(freq_top) == 0 || sum(freq_all) == 0) return(NULL)
+
+  freq_top <- freq_top / sum(freq_top)
+  freq_all <- freq_all / sum(freq_all)
+  all_lens <- union(names(freq_top), names(freq_all))
+  ratio <- sapply(all_lens, function(l) {
+    top_f <- if (l %in% names(freq_top)) as.numeric(freq_top[l]) else 0
+    all_f <- if (l %in% names(freq_all)) as.numeric(freq_all[l]) else 0
+    if (all_f == 0) return(0)
+    top_f / all_f
+  })
+  ratio <- ratio[ratio > 0]
+  if (sum(ratio) == 0) return(NULL)
+  as.list(ratio / sum(ratio))
 }
 
 
-extract_cdr3_len_dist_vj <- function(top_tcrs, chain_letter) {
+extract_cdr3_len_dist_vj <- function(top_tcrs, scored, chain_letter) {
   cdr3_col <- paste0("cdr3_TR", chain_letter)
   v_col    <- paste0("TR", chain_letter, "V")
   j_col    <- paste0("TR", chain_letter, "J")
   if (!all(c(cdr3_col, v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
-  keep <- !is.na(top_tcrs[[cdr3_col]]) & !is.na(top_tcrs[[v_col]]) &
-          !is.na(top_tcrs[[j_col]])
-  df   <- top_tcrs[keep, ]
-  if (nrow(df) == 0) return(NULL)
-  vj_keys <- paste0(df[[v_col]], "_", df[[j_col]])
-  lens    <- paste0("L_", nchar(df[[cdr3_col]]))
-  lapply(split(lens, vj_keys), function(l) {
-    tbl <- table(l); as.list(tbl / sum(tbl))
+
+  prep <- function(df) {
+    keep <- !is.na(df[[cdr3_col]]) & !is.na(df[[v_col]]) & !is.na(df[[j_col]])
+    df   <- df[keep, ]
+    split(paste0("L_", nchar(df[[cdr3_col]])), paste0(df[[v_col]], "_", df[[j_col]]))
+  }
+  top_by_vj <- prep(top_tcrs)
+  all_by_vj <- prep(scored)
+  if (length(top_by_vj) == 0) return(NULL)
+
+  lapply(setNames(names(top_by_vj), names(top_by_vj)), function(vj) {
+    l_top    <- top_by_vj[[vj]]
+    l_all    <- if (vj %in% names(all_by_vj)) all_by_vj[[vj]] else character(0)
+    freq_top <- table(l_top) / length(l_top)
+    if (length(l_all) == 0) return(as.list(freq_top / sum(freq_top)))
+    freq_all <- table(l_all) / length(l_all)
+    all_lens <- union(names(freq_top), names(freq_all))
+    ratio <- sapply(all_lens, function(l) {
+      top_f <- if (l %in% names(freq_top)) as.numeric(freq_top[l]) else 0
+      all_f <- if (l %in% names(freq_all)) as.numeric(freq_all[l]) else 0
+      if (all_f == 0) return(0)
+      top_f / all_f
+    })
+    ratio <- ratio[ratio > 0]
+    if (sum(ratio) == 0) return(NULL)
+    as.list(ratio / sum(ratio))
   })
 }
 
@@ -545,12 +576,12 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   vj_dist <- extract_vj_dist_chain(top_tcrs, chain_letter)
   sample_vj_pairs(vj_dist, chain_letter, n_pairs, step_dir)
 
-  # (2) CDR3 length distribution
+  # (2) CDR3 length distribution (relative enrichment: top binders vs all scored)
   if (len_dist_conditioned_on_vj) {
     len_dist    <- NULL
-    len_dist_vj <- extract_cdr3_len_dist_vj(top_tcrs, chain_letter)
+    len_dist_vj <- extract_cdr3_len_dist_vj(top_tcrs, scored, chain_letter)
   } else {
-    len_dist    <- extract_cdr3_len_dist(top_tcrs, chain_letter)
+    len_dist    <- extract_cdr3_len_dist(top_tcrs, scored, chain_letter)
     len_dist_vj <- NULL
   }
 
