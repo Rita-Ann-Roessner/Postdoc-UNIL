@@ -1,5 +1,5 @@
 # =============================================================================
-# Grid search over N_PAIRS × N_CDR3_MULTI
+# Grid search over VJ_PRIOR_STRENGTH
 # Sources TEMPO_motif_builder_test.R (functions + config only, run section
 # is skipped via the .sourced_by_optimizer guard).
 # Saves AUC / AUC0.1 per peptide × parameter combination to a CSV.
@@ -8,14 +8,13 @@
 .sourced_by_optimizer <- TRUE
 source("TEMPO_motif_builder_test.R", local = FALSE)
 
-GRID_OUTPUT_DIR <- "grid_search_runs"
+GRID_OUTPUT_DIR <- "grid_search_runs_prior"
 dir.create(GRID_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # ---- Grid definition --------------------------------------------------------
 
 grid <- expand.grid(
-  n_pairs      = c(50, 100, 200, 400),
-  n_cdr3_multi = c(1, 3, 5),
+  vj_prior_strength = c(0, 5, 20, 50, 100),
   stringsAsFactors = FALSE
 )
 
@@ -25,9 +24,8 @@ results <- data.frame()
 
 for (i in seq_len(nrow(grid))) {
 
-  np  <- grid$n_pairs[i]
-  nc  <- grid$n_cdr3_multi[i]
-  run_id <- sprintf("npairs%d_ncdr3%d", np, nc)
+  vps <- grid$vj_prior_strength[i]
+  run_id <- sprintf("vjprior%.1f", vps)
   message(sprintf("\n===== Grid run %d / %d : %s =====", i, nrow(grid), run_id))
 
   for (epitope in epitopes) {
@@ -44,8 +42,8 @@ for (i in seq_len(nrow(grid))) {
         cdr3_baseline      = cdr3_baseline,
         known_binders_file = file.path(BASE_OUTPUT_DIR, epitope, paste0(epitope, ".csv")),
         validation_file    = file.path(BASE_OUTPUT_DIR, epitope, "validation.csv"),
-        n_pairs            = np,
-        n_cdr3_multi       = nc,
+        vj_baseline_prior  = vj_baseline_prior,
+        vj_prior_strength  = vps,
         plot_motif         = FALSE,
         plot_final_motif   = FALSE,
         validate_each_step = FALSE
@@ -57,12 +55,11 @@ for (i in seq_len(nrow(grid))) {
     )
 
     row <- data.frame(
-      run_id       = run_id,
-      n_pairs      = np,
-      n_cdr3_multi = nc,
-      epitope      = epitope,
-      auc          = if (is.null(res)) NA_real_ else res$final_auc,
-      auc01        = if (is.null(res)) NA_real_ else res$final_auc01,
+      run_id            = run_id,
+      vj_prior_strength = vps,
+      epitope           = epitope,
+      auc               = if (is.null(res)) NA_real_ else res$final_auc,
+      auc01             = if (is.null(res)) NA_real_ else res$final_auc01,
       stringsAsFactors = FALSE
     )
     results <- rbind(results, row)

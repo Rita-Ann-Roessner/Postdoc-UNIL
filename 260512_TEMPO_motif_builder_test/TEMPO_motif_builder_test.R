@@ -21,18 +21,20 @@ library(pROC)
 ### ---- Configuration --------------------------------------------------------
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/HomoSapiens"
-BASE_OUTPUT_DIR <- "IMMREP23"
+BASE_OUTPUT_DIR <- "test"
 SCORE_COL       <- "perc_rank" # lower = better binder (HLA convention)
 N_ITERATIONS    <- 3           # scoring+enrichment steps (steps 1–N); step 0 is always flat random
 N_PAIRS         <- 400         # V/J pairs sampled per chain from top-binder distribution
-N_CDR3_MULTI    <- 5           # CDR3 sequences sampled per V/J pair (iterations > 0)
+N_CDR3_MULTI    <- 3           # CDR3 sequences sampled per V/J pair (iterations > 0)
 INIT_PERC_RANK  <- 10          # threshold for step 0; decays each step by DECAY_FACTOR
 DECAY_FACTOR    <- 0.135         # multiplicative decay per step: step k uses INIT × DECAY^k
 PSSM_WEIGHT     <- 0.643        # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM   <- 30         # minimum high-scorers required before using a PSSM
 LEN_DIST_COND_VJ <- FALSE      # if TRUE, sample CDR3 length | V/J pair; if FALSE, use marginal length dist
+VJ_PRIOR_STRENGTH <- 20        # alpha: repertoire-prior pseudocount weight for V/J shrinkage
+                                # (in evidence-count units; higher = more shrinkage toward baseline)
 
-EPITOPES_FILE <- "IMMREP23/epitopes.txt"   # path to a plain-text file with one epitope per line,
+EPITOPES_FILE <- NULL #"IMMREP23/epitopes.txt"   # path to a plain-text file with one epitope per line,
                         # e.g. "epitopes.txt"; set to NULL to use the list below
 epitopes <- c(
   "A0201_LLWNGPMAV",
@@ -209,7 +211,8 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
     if (length(valid_lens) > 0) {
       probs         <- unlist(active_len_dist[valid_lens])
       probs         <- probs / sum(probs)
-      selected_lens <- sample(valid_lens, size = n, replace = TRUE, prob = probs)
+      selected_lens <- sample(valid_lens, size = min(n, length(valid_lens)),
+                              replace = FALSE, prob = probs)
     } else {
       # no overlap between enriched lengths and this V/J pair — sample uniformly
       selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
@@ -385,22 +388,56 @@ run_tempo_scoring <- function(predictor_rds, pred_file, output_dir) {
 # Module 5 — Enrichment helpers
 # =============================================================================
 
-# Joint (V, J) probability distribution from top binders, per chain.
-# Returns a list with elements "A" and "B", each a named probability vector
-# over "TRAV_TRAJ" pair strings (e.g. "TRAV12-2_TRAJ33").
-# Sampling from the joint distribution guarantees only observed (V, J)
-# combinations are generated, maximising CDR3 baseline coverage.
-extract_vj_dist <- function(top_tcrs) {
-  lapply(setNames(c("A", "B"), c("A", "B")), function(chain) {
-    v_col <- paste0("TR", chain, "V")
-    j_col <- paste0("TR", chain, "J")
-    if (!all(c(v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
-    keep  <- !is.na(top_tcrs[[v_col]]) & !is.na(top_tcrs[[j_col]])
-    pairs <- paste(top_tcrs[[v_col]][keep], top_tcrs[[j_col]][keep], sep = "_")
-    if (length(pairs) == 0) return(NULL)
-    tbl <- table(pairs)
-    as.list(tbl / sum(tbl))
+# Repertoire V/J prior P_baseline(V, J), straight from MixTCRviz's
+# precomputed joint V/J frequency matrix (already normalized to sum to 1).
+# Returns a named list over "TRAV_TRAJ" pair strings.
+extract_vj_baseline_prior <- function(chain) {
+  chain_full <- paste0("TR", chain)
+  m <- baseline_HomoSapiens$countVJ[[chain_full]]
+  v <- as.vector(m)
+  names(v) <- outer(rownames(m), colnames(m), paste, sep = "_")
+  as.list(v[v > 0])
+}
+
+
+# Evidence-weighted, enrichment-based, baseline-shrunk V/J distribution.
+#   evidence(VJ)   = max(0, n_top(VJ) - n_all(VJ) * p_global)   [excess over
+#                    background pass rate — a VJ passing at exactly the
+#                    background rate contributes ~0 evidence, so it gets no
+#                    boost from raw passer counts alone]
+#   posterior(VJ) ∝ alpha * P_baseline(VJ) + evidence(VJ)        [Dirichlet/
+#                    empirical-Bayes shrinkage toward the repertoire prior,
+#                    weighted by how much evidence has accumulated]
+# Restricted to V/J pairs present in vj_baseline_prior, since those are the
+# only ones we can later draw CDR3 sequences for.
+extract_vj_dist_shrunk <- function(top_tcrs, scored, chain, vj_baseline_prior, alpha) {
+  v_col <- paste0("TR", chain, "V")
+  j_col <- paste0("TR", chain, "J")
+  if (!all(c(v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
+
+  key_of <- function(df) {
+    keep <- !is.na(df[[v_col]]) & !is.na(df[[j_col]])
+    paste(df[[v_col]][keep], df[[j_col]][keep], sep = "_")
+  }
+  top_keys <- key_of(top_tcrs)
+  all_keys <- key_of(scored)
+  if (length(all_keys) == 0) return(NULL)
+
+  n_top    <- table(top_keys)
+  n_all    <- table(all_keys)
+  p_global <- length(top_keys) / length(all_keys)
+
+  vj_pairs <- names(vj_baseline_prior)
+  evidence <- sapply(vj_pairs, function(vj) {
+    nt <- if (vj %in% names(n_top)) n_top[[vj]] else 0
+    na <- if (vj %in% names(n_all)) n_all[[vj]] else 0
+    max(0, nt - na * p_global)
   })
+
+  prior     <- unlist(vj_baseline_prior[vj_pairs])
+  posterior <- alpha * prior + evidence
+  if (sum(posterior) == 0) return(NULL)
+  as.list(posterior / sum(posterior))
 }
 
 
@@ -428,14 +465,26 @@ sample_vj_pairs <- function(vj_dist, chain, n_pairs, output_dir) {
 }
 
 
-extract_cdr3_len_dist <- function(top_tcrs, chain) {
+extract_cdr3_len_dist <- function(top_tcrs, scored, chain) {
   cdr3_col <- paste0("cdr3_TR", chain)
   if (!cdr3_col %in% colnames(top_tcrs)) return(NULL)
-  lens <- nchar(top_tcrs[[cdr3_col]])
-  lens <- lens[!is.na(lens) & lens > 0]
-  if (length(lens) == 0) return(NULL)
-  tbl  <- table(paste0("L_", lens))
-  as.list(tbl / sum(tbl))
+
+  freq_top <- table(paste0("L_", nchar(top_tcrs[[cdr3_col]][!is.na(top_tcrs[[cdr3_col]])])))
+  freq_all <- table(paste0("L_", nchar(scored[[cdr3_col]][!is.na(scored[[cdr3_col]])])))
+  if (sum(freq_top) == 0 || sum(freq_all) == 0) return(NULL)
+
+  freq_top <- freq_top / sum(freq_top)
+  freq_all <- freq_all / sum(freq_all)
+  all_lens <- union(names(freq_top), names(freq_all))
+  ratio <- sapply(all_lens, function(l) {
+    top_f <- if (l %in% names(freq_top)) as.numeric(freq_top[l]) else 0
+    all_f <- if (l %in% names(freq_all)) as.numeric(freq_all[l]) else 0
+    if (all_f == 0) return(0)
+    top_f / all_f
+  })
+  ratio <- ratio[ratio > 0]
+  if (sum(ratio) == 0) return(NULL)
+  as.list(ratio / sum(ratio))
 }
 
 
@@ -444,25 +493,38 @@ extract_cdr3_len_dist <- function(top_tcrs, chain) {
 # Each element is a length-probability list (same format as extract_cdr3_len_dist).
 # Falls back gracefully: callers should use the marginal len_dist when the VJ
 # key is absent (e.g. rare pairs with zero top-binder observations).
-extract_cdr3_len_dist_vj <- function(top_tcrs, chain) {
+extract_cdr3_len_dist_vj <- function(top_tcrs, scored, chain) {
   cdr3_col <- paste0("cdr3_TR", chain)
   v_col    <- paste0("TR", chain, "V")
   j_col    <- paste0("TR", chain, "J")
   if (!all(c(cdr3_col, v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
 
-  keep <- !is.na(top_tcrs[[cdr3_col]]) & !is.na(top_tcrs[[v_col]]) &
-          !is.na(top_tcrs[[j_col]])
-  df   <- top_tcrs[keep, ]
-  if (nrow(df) == 0) return(NULL)
+  prep <- function(df) {
+    keep <- !is.na(df[[cdr3_col]]) & !is.na(df[[v_col]]) & !is.na(df[[j_col]])
+    df   <- df[keep, ]
+    split(paste0("L_", nchar(df[[cdr3_col]])), paste0(df[[v_col]], "_", df[[j_col]]))
+  }
+  top_by_vj <- prep(top_tcrs)
+  all_by_vj <- prep(scored)
+  if (length(top_by_vj) == 0) return(NULL)
 
-  vj_keys <- paste0(df[[v_col]], "_", df[[j_col]])
-  lens    <- paste0("L_", nchar(df[[cdr3_col]]))
-
-  vj_len_dist <- lapply(split(lens, vj_keys), function(l) {
-    tbl <- table(l)
-    as.list(tbl / sum(tbl))
+  lapply(setNames(names(top_by_vj), names(top_by_vj)), function(vj) {
+    l_top    <- top_by_vj[[vj]]
+    l_all    <- if (vj %in% names(all_by_vj)) all_by_vj[[vj]] else character(0)
+    freq_top <- table(l_top) / length(l_top)
+    if (length(l_all) == 0) return(as.list(freq_top / sum(freq_top)))
+    freq_all <- table(l_all) / length(l_all)
+    all_lens <- union(names(freq_top), names(freq_all))
+    ratio <- sapply(all_lens, function(l) {
+      top_f <- if (l %in% names(freq_top)) as.numeric(freq_top[l]) else 0
+      all_f <- if (l %in% names(freq_all)) as.numeric(freq_all[l]) else 0
+      if (all_f == 0) return(0)
+      top_f / all_f
+    })
+    ratio <- ratio[ratio > 0]
+    if (sum(ratio) == 0) return(NULL)
+    as.list(ratio / sum(ratio))
   })
-  vj_len_dist
 }
 
 
@@ -600,11 +662,12 @@ score_step <- function(predictor_rds, model_csv, threshold,
 # Returns the path to the new model.csv, or NULL if too few top binders.
 # =============================================================================
 
-enrich_generate_step <- function(top_tcrs,
+enrich_generate_step <- function(top_tcrs, all_tcrs,
                                   step, label, peptide, mhc,
                                   base_output_dir, cdr3_baseline,
                                   n_pairs, n_cdr3_multi,
                                   pssm_weight, min_tcrs_pssm,
+                                  vj_baseline_prior, vj_prior_strength,
                                   len_dist_conditioned_on_vj = LEN_DIST_COND_VJ) {
 
   if (nrow(top_tcrs) < 10) {
@@ -615,8 +678,11 @@ enrich_generate_step <- function(top_tcrs,
   step_dir <- file.path(base_output_dir, label, sprintf("step%d", step))
   dir.create(step_dir, showWarnings = FALSE, recursive = TRUE)
 
-  # (1) V/J distribution from top binders → sample n_pairs pairs per chain
-  vj_dist <- extract_vj_dist(top_tcrs)
+  # (1) V/J distribution: enrichment evidence shrunk toward repertoire baseline
+  vj_dist <- list(
+    A = extract_vj_dist_shrunk(top_tcrs, all_tcrs, "A", vj_baseline_prior$A, vj_prior_strength),
+    B = extract_vj_dist_shrunk(top_tcrs, all_tcrs, "B", vj_baseline_prior$B, vj_prior_strength)
+  )
   sample_vj_pairs(vj_dist, "A", n_pairs, step_dir)
   sample_vj_pairs(vj_dist, "B", n_pairs, step_dir)
 
@@ -625,11 +691,11 @@ enrich_generate_step <- function(top_tcrs,
   if (len_dist_conditioned_on_vj) {
     len_dist_A    <- NULL   # not used when conditioning on VJ
     len_dist_B    <- NULL
-    len_dist_vj_A <- extract_cdr3_len_dist_vj(top_tcrs, "A")
-    len_dist_vj_B <- extract_cdr3_len_dist_vj(top_tcrs, "B")
+    len_dist_vj_A <- extract_cdr3_len_dist_vj(top_tcrs, all_tcrs, "A")
+    len_dist_vj_B <- extract_cdr3_len_dist_vj(top_tcrs, all_tcrs, "B")
   } else {
-    len_dist_A    <- extract_cdr3_len_dist(top_tcrs, "A")
-    len_dist_B    <- extract_cdr3_len_dist(top_tcrs, "B")
+    len_dist_A    <- extract_cdr3_len_dist(top_tcrs, all_tcrs, "A")
+    len_dist_B    <- extract_cdr3_len_dist(top_tcrs, all_tcrs, "B")
     len_dist_vj_A <- NULL
     len_dist_vj_B <- NULL
   }
@@ -688,6 +754,8 @@ run_motif_builder <- function(peptide, mhc,
                                decay_factor     = DECAY_FACTOR,
                                pssm_weight      = PSSM_WEIGHT,
                                min_tcrs_pssm    = MIN_TCRS_PSSM,
+                               vj_baseline_prior,
+                               vj_prior_strength          = VJ_PRIOR_STRENGTH,
                                score_col                  = SCORE_COL,
                                plot_motif                 = FALSE,
                                plot_final_motif           = TRUE,
@@ -778,6 +846,7 @@ run_motif_builder <- function(peptide, mhc,
 
     new_model_csv <- enrich_generate_step(
       top_tcrs                   = top_tcrs,
+      all_tcrs                   = all_tcrs,
       step                       = iter,
       label                      = label,
       peptide                    = peptide, mhc = mhc,
@@ -787,6 +856,8 @@ run_motif_builder <- function(peptide, mhc,
       n_cdr3_multi               = n_cdr3_multi,
       pssm_weight                = pssm_weight,
       min_tcrs_pssm              = min_tcrs_pssm,
+      vj_baseline_prior          = vj_baseline_prior,
+      vj_prior_strength          = vj_prior_strength,
       len_dist_conditioned_on_vj = len_dist_conditioned_on_vj
     )
     if (is.null(new_model_csv)) break
@@ -868,6 +939,7 @@ run_motif_builder <- function(peptide, mhc,
 
 baseline      <- MixTCRviz::baseline_HomoSapiens
 cdr3_baseline <- baseline$countCDR3.VJL
+vj_baseline_prior <- list(A = extract_vj_baseline_prior("A"), B = extract_vj_baseline_prior("B"))
 
 .run_pipeline         <- !exists(".sourced_by_optimizer") || !.sourced_by_optimizer
 .sourced_by_optimizer <- FALSE   # reset so future direct runs always work
@@ -885,6 +957,7 @@ if (.run_pipeline) {
       peptide            = peptide,
       mhc                = mhc,
       cdr3_baseline      = cdr3_baseline,
+      vj_baseline_prior  = vj_baseline_prior,
       known_binders_file = file.path(BASE_OUTPUT_DIR, epitope, paste0(epitope, ".csv")),
       validation_file    = file.path(BASE_OUTPUT_DIR, epitope, "validation.csv")
     )

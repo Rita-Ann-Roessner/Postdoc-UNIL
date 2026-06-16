@@ -14,7 +14,7 @@ source("TEMPO_motif_builder_test.R", local = FALSE)
 # Working directory should be:
 # /Users/roessner/Documents/PostDoc/Data/260512_TEMPO_motif_builder_test
 
-OPTIMIZER_OUTPUT_DIR <- "optimizer_runs"
+OPTIMIZER_OUTPUT_DIR <- "optimizer_runs_prior"
 dir.create(OPTIMIZER_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # =============================================================================
@@ -26,8 +26,8 @@ dir.create(OPTIMIZER_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 eval_log <- data.frame()
 
-objective <- function(pssm_weight, decay_factor) {
-  run_id  <- sprintf("pw%.2f_df%.3f", pssm_weight, decay_factor)
+objective <- function(pssm_weight, decay_factor, vj_prior_strength) {
+  run_id  <- sprintf("pw%.2f_df%.3f_vj%.1f", pssm_weight, decay_factor, vj_prior_strength)
   message(sprintf("\n>>> Evaluating: %s", run_id))
 
   res_list <- list()
@@ -46,6 +46,8 @@ objective <- function(pssm_weight, decay_factor) {
         validation_file    = file.path(BASE_OUTPUT_DIR, epitope, "validation.csv"),
         pssm_weight        = pssm_weight,
         decay_factor       = decay_factor,
+        vj_baseline_prior  = vj_baseline_prior,
+        vj_prior_strength  = vj_prior_strength,
         plot_motif         = FALSE,
         plot_final_motif   = TRUE,
         validate_each_step = TRUE
@@ -68,15 +70,22 @@ objective <- function(pssm_weight, decay_factor) {
   new_rows <- do.call(rbind, lapply(epitopes, function(ep) {
     res_p  <- res_list[[ep]]
     row <- data.frame(
-      run_id       = run_id,
-      pssm_weight  = pssm_weight,
-      decay_factor = decay_factor,
-      mean_auc01   = score,
+      run_id            = run_id,
+      pssm_weight       = pssm_weight,
+      decay_factor      = decay_factor,
+      vj_prior_strength = vj_prior_strength,
+      mean_auc01        = score,
       epitope      = ep,
       auc01        = auc01_vals[[ep]],
       stringsAsFactors = FALSE
     )
     # add per-step auc01 as wide columns (auc01_step0, auc01_step1, ...)
+    # Pre-allocate all N_ITERATIONS+1 step columns as NA so every epitope's
+    # row has the same column set, even if it stopped early (too few top
+    # binders) and never reached the later steps.
+    for (s in 0:N_ITERATIONS) {
+      row[[sprintf("auc01_step%d", s)]] <- NA_real_
+    }
     if (!is.null(res_p) && !is.null(res_p$step_counts) &&
         "auc01" %in% colnames(res_p$step_counts)) {
       sc <- res_p$step_counts
@@ -107,8 +116,9 @@ set.seed(42)
 bayes_result <- BayesianOptimization(
   FUN         = objective,
   bounds      = list(
-    pssm_weight  = c(0,    1),
-    decay_factor = c(0.05, 0.9)
+    pssm_weight       = c(0,    1),
+    decay_factor      = c(0.05, 0.9),
+    vj_prior_strength = c(0,    100)
   ),
   init_points = 8,
   n_iter      = 20,
@@ -125,8 +135,9 @@ bayes_result <- BayesianOptimization(
 
 best <- bayes_result$Best_Par
 message("\n===== Best parameters =====")
-message(sprintf("  PSSM_WEIGHT  = %.3f", best["pssm_weight"]))
-message(sprintf("  DECAY_FACTOR = %.3f", best["decay_factor"]))
+message(sprintf("  PSSM_WEIGHT       = %.3f", best["pssm_weight"]))
+message(sprintf("  DECAY_FACTOR      = %.3f", best["decay_factor"]))
+message(sprintf("  VJ_PRIOR_STRENGTH = %.3f", best["vj_prior_strength"]))
 schedule <- INIT_PERC_RANK * best["decay_factor"]^(0:N_ITERATIONS)
 message(sprintf("  threshold schedule: %s",
                 paste(sprintf("%.3f", schedule), collapse = " -> ")))

@@ -17,8 +17,8 @@ library(pROC)
 .sourced_by_optimizer <- TRUE
 source("TEMPO_motif_builder_test.R", local = FALSE)
 
-BRUTE_OUTPUT_DIR <- "IMMREP23/brute_force_runs_small" # "brute_force_runs"
-N_RANDOM         <- 8267 #1e6    # random TCRs to generate
+BRUTE_OUTPUT_DIR <- "test/brute_force_runs_small" # "brute_force_runs"
+N_RANDOM         <- 5867 #1e6    # random TCRs to generate
 TOP_PERC         <- 0.001  # top fraction to keep (0.001 = 0.1%)
 
 dir.create(BRUTE_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
