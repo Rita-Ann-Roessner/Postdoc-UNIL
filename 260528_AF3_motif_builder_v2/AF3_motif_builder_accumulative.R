@@ -32,23 +32,21 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 1 #c(1, 2, 3, 4)        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- c(1, 2, 3, 4)        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_prior"
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_accumulative"
 SCORE_COL       <- "AF3_iptm_pair_mean"   # column in af3_scores_*.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
-AF3_THRESHOLDS  <- c(0.5) #c(0.5, 0.6, 0.7, 0.7)
+AF3_THRESHOLDS  <- c(0.8, 0.8, 0.8, 0.8)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
 PSSM_WEIGHT      <- 0.643  # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
 LEN_DIST_COND_VJ <- FALSE  # if TRUE, sample CDR3 length | V/J; if FALSE, use marginal
-VJ_PRIOR_STRENGTH <- 20    # alpha: repertoire-prior pseudocount weight for V/J shrinkage
-                            # (in evidence-count units; higher = more shrinkage toward baseline)
 
 PLOT_EACH_STEP     <- TRUE   # if TRUE, plot MixTCRviz motif after each enrichment step
 VALIDATE_EACH_STEP <- TRUE  # if TRUE, run TEMPO validation after each enrichment step
@@ -309,56 +307,15 @@ load_af3_scores <- function(scores_file, model_file, score_col = SCORE_COL) {
 # Module 5 — Enrichment helpers (per-chain)
 # =============================================================================
 
-# Repertoire V/J prior P_baseline(V, J), straight from MixTCRviz's
-# precomputed joint V/J frequency matrix (already normalized to sum to 1).
-# Returns a named list over "TRAV_TRAJ" pair strings.
-extract_vj_baseline_prior <- function(chain_letter) {
-  chain_full <- paste0("TR", chain_letter)
-  m <- baseline_HomoSapiens$countVJ[[chain_full]]
-  v <- as.vector(m)
-  names(v) <- outer(rownames(m), colnames(m), paste, sep = "_")
-  as.list(v[v > 0])
-}
-
-
-# Evidence-weighted, enrichment-based, baseline-shrunk V/J distribution.
-#   evidence(VJ)   = max(0, n_top(VJ) - n_all(VJ) * p_global)   [excess over
-#                    background pass rate — a VJ passing at exactly the
-#                    background rate contributes ~0 evidence, so it gets no
-#                    boost from raw passer counts alone]
-#   posterior(VJ) ∝ alpha * P_baseline(VJ) + evidence(VJ)        [Dirichlet/
-#                    empirical-Bayes shrinkage toward the repertoire prior,
-#                    weighted by how much evidence has accumulated]
-# Restricted to V/J pairs present in vj_baseline_prior, since those are the
-# only ones we can later draw CDR3 sequences for.
-extract_vj_dist_chain_shrunk <- function(top_tcrs, scored, chain_letter, vj_baseline_prior, alpha) {
+extract_vj_dist_chain <- function(top_tcrs, chain_letter) {
   v_col <- paste0("TR", chain_letter, "V")
   j_col <- paste0("TR", chain_letter, "J")
   if (!all(c(v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
-
-  key_of <- function(df) {
-    keep <- !is.na(df[[v_col]]) & !is.na(df[[j_col]])
-    paste(df[[v_col]][keep], df[[j_col]][keep], sep = "_")
-  }
-  top_keys <- key_of(top_tcrs)
-  all_keys <- key_of(scored)
-  if (length(all_keys) == 0) return(NULL)
-
-  n_top    <- table(top_keys)
-  n_all    <- table(all_keys)
-  p_global <- length(top_keys) / length(all_keys)
-
-  vj_pairs <- names(vj_baseline_prior)
-  evidence <- sapply(vj_pairs, function(vj) {
-    nt <- if (vj %in% names(n_top)) n_top[[vj]] else 0
-    na <- if (vj %in% names(n_all)) n_all[[vj]] else 0
-    max(0, nt - na * p_global)
-  })
-
-  prior     <- unlist(vj_baseline_prior[vj_pairs])
-  posterior <- alpha * prior + evidence
-  if (sum(posterior) == 0) return(NULL)
-  as.list(posterior / sum(posterior))
+  keep  <- !is.na(top_tcrs[[v_col]]) & !is.na(top_tcrs[[j_col]])
+  pairs <- paste(top_tcrs[[v_col]][keep], top_tcrs[[j_col]][keep], sep = "_")
+  if (length(pairs) == 0) return(NULL)
+  tbl <- table(pairs)
+  as.list(tbl / sum(tbl))
 }
 
 
@@ -438,6 +395,21 @@ extract_cdr3_len_dist_vj <- function(top_tcrs, scored, chain_letter) {
     if (sum(ratio) == 0) return(NULL)
     as.list(ratio / sum(ratio))
   })
+}
+
+
+# Load and combine top_tcrs_*.csv from step 1 through max_step (inclusive).
+# Step 0 binders (from the flat-random baseline) are excluded.
+collect_accumulated_top_tcrs <- function(chain_letter, max_step, label, base_output_dir) {
+  chain_name <- if (chain_letter == "A") "alpha" else "beta"
+  dfs <- lapply(1:max_step, function(k) {
+    f <- file.path(base_output_dir, label, sprintf("step%d", k),
+                   sprintf("top_tcrs_%s.csv", chain_name))
+    if (file.exists(f)) read.csv(f) else NULL
+  })
+  dfs <- Filter(Negate(is.null), dfs)
+  if (length(dfs) == 0) return(NULL)
+  bind_rows(dfs)
 }
 
 
@@ -586,7 +558,6 @@ run_step0 <- function(peptide, mhc_allele, label, cdr3_baseline,
 enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, species,
                               base_output_dir, cdr3_baseline,
                               n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
-                              vj_baseline_prior, vj_prior_strength,
                               threshold, len_dist_conditioned_on_vj = LEN_DIST_COND_VJ) {
 
   chain_name    <- if (chain_letter == "A") "alpha" else "beta"
@@ -616,9 +587,8 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
     return(NULL)
   }
 
-  # (1) V/J distribution: enrichment evidence shrunk toward repertoire baseline
-  vj_dist <- extract_vj_dist_chain_shrunk(top_tcrs, scored, chain_letter,
-                                          vj_baseline_prior[[chain_letter]], vj_prior_strength)
+  # (1) V/J distribution from top binders
+  vj_dist <- extract_vj_dist_chain(top_tcrs, chain_letter)
   sample_vj_pairs(vj_dist, chain_letter, n_pairs, step_dir)
 
   # (2) CDR3 length distribution (relative enrichment: top binders vs all scored)
@@ -663,7 +633,6 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
 run_enrich_step <- function(step, peptide, mhc_allele, label,
                              cdr3_baseline, base_output_dir,
                              n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
-                             vj_baseline_prior, vj_prior_strength,
                              af3_thresholds, species = "HomoSapiens",
                              len_dist_conditioned_on_vj = LEN_DIST_COND_VJ,
                              plot_each_step     = PLOT_EACH_STEP,
@@ -679,25 +648,31 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
   top_alpha <- enrich_one_chain("A", step, label, peptide, mhc_allele, species,
                                 base_output_dir, cdr3_baseline,
                                 n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
-                                vj_baseline_prior, vj_prior_strength,
                                 threshold, len_dist_conditioned_on_vj)
   top_beta  <- enrich_one_chain("B", step, label, peptide, mhc_allele, species,
                                 base_output_dir, cdr3_baseline,
                                 n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
-                                vj_baseline_prior, vj_prior_strength,
                                 threshold, len_dist_conditioned_on_vj)
+
+  # Pool top binders from all steps 0..step-1 for motif building and training.
+  # Enrichment (V/J sampling, PSSM) inside enrich_one_chain still uses current step only.
+  acc_alpha <- collect_accumulated_top_tcrs("A", step - 1, label, base_output_dir)
+  acc_beta  <- collect_accumulated_top_tcrs("B", step - 1, label, base_output_dir)
+  message(sprintf("  [accumulated] alpha: %d, beta: %d top binders",
+                  if (!is.null(acc_alpha)) nrow(acc_alpha) else 0L,
+                  if (!is.null(acc_beta))  nrow(acc_beta)  else 0L))
 
   # Optional: MixTCRviz motif plots — saved into prev_step_dir (scores source)
   if (plot_each_step) {
-    if (!is.null(top_alpha) && nrow(top_alpha) >= 10)
-      plot_step_motif(top_alpha, "A", label, step - 1, prev_step_dir)
-    if (!is.null(top_beta) && nrow(top_beta) >= 10)
-      plot_step_motif(top_beta, "B", label, step - 1, prev_step_dir)
+    if (!is.null(acc_alpha) && nrow(acc_alpha) >= 10)
+      plot_step_motif(acc_alpha, "A", label, step - 1, prev_step_dir)
+    if (!is.null(acc_beta) && nrow(acc_beta) >= 10)
+      plot_step_motif(acc_beta, "B", label, step - 1, prev_step_dir)
   }
 
-  # Always write the combined top-binder motif file into prev_step_dir
+  # Always write the accumulated top-binder motif file into prev_step_dir
   model_label <- paste0(mhc, "_", peptide)
-  motif_df    <- build_motif_df(top_alpha, top_beta, model_label)
+  motif_df    <- build_motif_df(acc_alpha, acc_beta, model_label)
   motif_file  <- NULL
   if (!is.null(motif_df)) {
     motif_file <- file.path(prev_step_dir, "motif_top_binders.csv")
@@ -751,11 +726,18 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
     top_tcrs
   }
 
-  top_alpha <- collect_top("A")
-  top_beta  <- collect_top("B")
+  collect_top("A")
+  collect_top("B")
+
+  # Pool top binders from all steps 0..n_steps for TEMPO training
+  acc_alpha <- collect_accumulated_top_tcrs("A", n_steps, label, base_output_dir)
+  acc_beta  <- collect_accumulated_top_tcrs("B", n_steps, label, base_output_dir)
+  message(sprintf("  [accumulated] alpha: %d, beta: %d top binders",
+                  if (!is.null(acc_alpha)) nrow(acc_alpha) else 0L,
+                  if (!is.null(acc_beta))  nrow(acc_beta)  else 0L))
 
   model_label <- paste0(mhc, "_", peptide)
-  motif_df    <- build_motif_df(top_alpha, top_beta, model_label)
+  motif_df    <- build_motif_df(acc_alpha, acc_beta, model_label)
 
   if (is.null(motif_df)) {
     warning(sprintf("[%s] No top binders found — cannot run TEMPO validation.", label))
@@ -785,7 +767,6 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
 
 baseline      <- MixTCRviz::baseline_HomoSapiens
 cdr3_baseline <- baseline$countCDR3.VJL
-vj_baseline_prior <- list(A = extract_vj_baseline_prior("A"), B = extract_vj_baseline_prior("B"))
 
 auc_summary <- list()
 
@@ -822,8 +803,6 @@ for (epitope in epitopes) {
         n_cdr3_multi               = N_CDR3_MULTI,
         pssm_weight                = PSSM_WEIGHT,
         min_tcrs_pssm              = MIN_TCRS_PSSM,
-        vj_baseline_prior          = vj_baseline_prior,
-        vj_prior_strength          = VJ_PRIOR_STRENGTH,
         af3_thresholds             = AF3_THRESHOLDS,
         len_dist_conditioned_on_vj = LEN_DIST_COND_VJ,
         plot_each_step             = PLOT_EACH_STEP,
