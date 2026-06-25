@@ -28,7 +28,7 @@ N_PAIRS         <- 400         # V/J pairs sampled per chain from top-binder dis
 N_CDR3_MULTI    <- 3           # CDR3 sequences sampled per V/J pair (iterations > 0)
 INIT_PERC_RANK  <- 10          # threshold for step 0; decays each step by DECAY_FACTOR
 DECAY_FACTOR    <- 0.135         # multiplicative decay per step: step k uses INIT × DECAY^k
-PSSM_WEIGHT     <- 0.643        # blend weight: 0 = pure baseline, 1 = pure PSSM
+PSSM_WEIGHT     <- 1.0        # blend weight: 0 = pure baseline, 1 = pure PSSM
 MIN_TCRS_PSSM   <- 30         # minimum high-scorers required before using a PSSM
 LEN_DIST_COND_VJ <- FALSE      # if TRUE, sample CDR3 length | V/J pair; if FALSE, use marginal length dist
 VJ_PRIOR_STRENGTH <- 20        # alpha: repertoire-prior pseudocount weight for V/J shrinkage
@@ -230,13 +230,29 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
       else               col / sum(col)
     })
 
-    # (3) Blend with PSSM when available and dimensions match
+    # (3) Blend with PSSM when available and dimensions match.
+    # Per-position weight (IC-modulated): trust the PSSM more where the
+    # baseline is uninformative (low IC — the variable junction) and less
+    # where the baseline is conserved (high IC — the anchors). IC is computed
+    # from the normalized baseline column, so the weight is scale-free
+    # (independent of baseline depth M and of the number of top binders).
+    #   w(pos) = pssm_weight * (1 - IC_baseline(pos) / log2(K))
+    # with IC_baseline(pos) = log2(K) - H(pos), K = alphabet size.
     if (!is.null(cdr3_pssm) && !is.null(cdr3_pssm[[len_name]])) {
       pssm      <- cdr3_pssm[[len_name]]
       aa_common <- intersect(rownames(prob_mat), rownames(pssm))
       if (length(aa_common) >= 10 && ncol(pssm) == ncol(prob_mat)) {
-        prob_mat[aa_common, ] <- (1 - pssm_weight) * prob_mat[aa_common, ] +
-                                       pssm_weight  * pssm[aa_common, ]
+        max_ic <- log2(nrow(prob_mat))                 # log2(K); K = 20 for AAs
+        ic_pos <- apply(prob_mat, 2, function(col) {
+          p <- col[col > 0]
+          max_ic + sum(p * log2(p))                    # = max_ic - H(col)
+        })
+        w_pos <- pssm_weight * (1 - ic_pos / max_ic)   # per-position PSSM weight
+        w_pos <- pmax(0, pmin(pssm_weight, w_pos))     # numerical safety
+        for (pos in seq_len(ncol(prob_mat))) {
+          prob_mat[aa_common, pos] <- (1 - w_pos[pos]) * prob_mat[aa_common, pos] +
+                                            w_pos[pos]  * pssm[aa_common, pos]
+        }
         prob_mat <- apply(prob_mat, 2, function(col) col / sum(col))
       }
     }
@@ -398,6 +414,7 @@ extract_vj_baseline_prior <- function(chain) {
   names(v) <- outer(rownames(m), colnames(m), paste, sep = "_")
   as.list(v[v > 0])
 }
+
 
 
 # Evidence-weighted, enrichment-based, baseline-shrunk V/J distribution.
