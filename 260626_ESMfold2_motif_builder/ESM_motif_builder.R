@@ -21,8 +21,8 @@ library(pROC)
 #              → model_alpha.csv / model_alpha_seqs.csv  (real α + dummy β)
 #              → model_beta.csv  / model_beta_seqs.csv   (dummy α + real β)
 #              → Run ESMFold (fold.py) on cluster; place results as:
-#                  step0/model_alpha_output.txt
-#                  step0/model_beta_output.txt
+#                  step0/output_alpha.csv
+#                  step0/output_beta.csv
 #   Steps 1–N: Load ESM scores → filter (iptm_pair_mean >= threshold)
 #              → enrich V/J + CDR3 length + PSSM per chain
 #              → generate new batches → run ESMFold on cluster
@@ -38,7 +38,7 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 0 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 1 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
@@ -461,14 +461,24 @@ sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file
 # =============================================================================
 
 load_esm_scores <- function(scores_file, model_file, score_col = SCORE_COL) {
-  scores <- read.table(scores_file, header = TRUE, sep = "\t")
-  model  <- read.table(model_file,  header = TRUE, sep = "\t")
+  scores <- read.csv(scores_file, stringsAsFactors = FALSE, check.names = FALSE)
+  model  <- read.csv(model_file,  stringsAsFactors = FALSE, check.names = FALSE)
+
+  # The ESMFold output (output_<chain>.csv) keys on 'ID'; the model table
+  # (model_<chain>.csv) keys on 'id'. Normalise both to lowercase 'id'.
+  fix_id <- function(df) {
+    hit <- which(tolower(names(df)) == "id")
+    if (length(hit) >= 1) names(df)[hit[1]] <- "id"
+    df
+  }
+  scores <- fix_id(scores)
+  model  <- fix_id(model)
 
   if (!score_col %in% colnames(scores))
     stop("Column '", score_col, "' not found in ESM scores file.\n",
          "Available: ", paste(colnames(scores), collapse = ", "))
   if (!"id" %in% colnames(scores) || !"id" %in% colnames(model))
-    stop("Both the ESM scores file and model CSV must have an 'id' column.")
+    stop("Both the ESM scores file and model table must have an 'id'/'ID' column.")
 
   merge(model, scores[, c("id", score_col)], by = "id")
 }
@@ -743,8 +753,8 @@ run_step0 <- function(peptide, mhc_allele, label, cdr3_baseline,
   message(sprintf("[%s] Step 0 done: %d alpha-batch TCRs, %d beta-batch TCRs.", label, n_alpha, n_beta))
   message(sprintf("[%s] → Run ESMFold on cluster, then place results as:\n  %s\n  %s",
                   label,
-                  file.path(step_dir, "model_alpha_output.txt"),
-                  file.path(step_dir, "model_beta_output.txt")))
+                  file.path(step_dir, "output_alpha.csv"),
+                  file.path(step_dir, "output_beta.csv")))
 
   invisible(step_dir)
 }
@@ -763,13 +773,13 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   step_dir      <- file.path(base_output_dir, label, sprintf("step%d", step))
   dir.create(step_dir, showWarnings = FALSE, recursive = TRUE)
 
-  scores_file <- file.path(prev_step_dir, sprintf("model_%s_output.txt", chain_name))
-  model_file  <- file.path(prev_step_dir, sprintf("model_%s_input.txt",  chain_name))
+  scores_file <- file.path(prev_step_dir, sprintf("output_%s.csv", chain_name))
+  model_file  <- file.path(prev_step_dir, sprintf("model_%s.csv",  chain_name))
 
   if (!file.exists(scores_file))
     stop(sprintf("[%s] ESM scores file missing: %s\nRun ESMFold (fold.py) on the cluster first.", label, scores_file))
   if (!file.exists(model_file))
-    stop(sprintf("[%s] Model input file missing: %s\nThis file is the model_%s table (V/J + CDR3 + id) carried alongside the fold.py run.", label, model_file, chain_name))
+    stop(sprintf("[%s] Model table missing: %s\nThis is the model_%s.csv batch generated for this step.", label, model_file, chain_name))
 
   scored   <- load_esm_scores(scores_file, model_file)
   top_tcrs <- scored[scored[[SCORE_COL]] >= threshold, ]
@@ -887,8 +897,8 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
   message(sprintf("[%s] Step %d done.", label, step))
   message(sprintf("[%s] → Run ESMFold on cluster, then place results as:\n  %s\n  %s",
                   label,
-                  file.path(step_dir, "model_alpha_output.txt"),
-                  file.path(step_dir, "model_beta_output.txt")))
+                  file.path(step_dir, "output_alpha.csv"),
+                  file.path(step_dir, "output_beta.csv")))
 
   invisible(list(top_alpha = top_alpha, top_beta = top_beta))
 }
@@ -905,8 +915,8 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
 
   collect_top <- function(chain_letter) {
     chain_name  <- if (chain_letter == "A") "alpha" else "beta"
-    scores_file <- file.path(last_step_dir, sprintf("model_%s_output.txt", chain_name))
-    model_file  <- file.path(last_step_dir, sprintf("model_%s_input.txt",  chain_name))
+    scores_file <- file.path(last_step_dir, sprintf("output_%s.csv", chain_name))
+    model_file  <- file.path(last_step_dir, sprintf("model_%s.csv",  chain_name))
     if (!file.exists(scores_file)) {
       warning(sprintf("[%s] ESM scores file missing: %s — skipping chain %s.",
                       label, scores_file, chain_letter))
