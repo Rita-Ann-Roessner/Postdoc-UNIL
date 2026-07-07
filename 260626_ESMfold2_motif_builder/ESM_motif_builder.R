@@ -38,7 +38,7 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 1 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 0 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
@@ -46,15 +46,19 @@ BASE_OUTPUT_DIR <- "TCR_motif_atlas"
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
-ESM_THRESHOLDS  <- c(0.5, 0.6, 0.7) #c(0.5, 0.6, 0.7, 0.7)
+#ESM_THRESHOLDS  <- c(0.5, 0.6, 0.7) #c(0.5, 0.6, 0.7, 0.7)
+ESM_THRESHOLDS  <- c(0.5, 0.6, 0.7)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
-PSSM_WEIGHT      <- 1  # blend weight: 0 = pure baseline, 1 = pure PSSM
+MUT_WEIGHT       <- 0.1    # IC-adjusted random-mutation rate: 0 = off; >0 mixes a uniform
+                           # component into each CDR3 position, strongest at low-IC (variable)
+                           # sites, ~0 at conserved anchors (affinity maturation). The PSSM
+                           # blend is fixed to full weight at the junction (former PSSM_WEIGHT=1).
 MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
-LEN_DIST_COND_VJ <- FALSE  # if TRUE, sample CDR3 length | V/J; if FALSE, use marginal
-VJ_PRIOR_STRENGTH <- 20    # alpha: repertoire-prior pseudocount weight for V/J shrinkage
-                            # (in evidence-count units; higher = more shrinkage toward baseline)
+VJ_PRIOR_STRENGTH  <- 30   # alpha: repertoire-prior pseudocount weight for V/J shrinkage
+                           # (in evidence-count units; higher = more shrinkage toward baseline)
+LEN_PRIOR_STRENGTH <- 20   # beta: same idea, for the CDR3-length enrichment shrinkage
 
 PLOT_EACH_STEP     <- TRUE   # if TRUE, plot MixTCRviz motif after each enrichment step
 VALIDATE_EACH_STEP <- TRUE  # if TRUE, run TEMPO validation after each enrichment step
@@ -353,32 +357,30 @@ build_cdr3_pssm <- function(cdr3_seqs, pseudocount = 0.1) {
 # =============================================================================
 
 draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
-                                    n = 5, len_dist = NULL, len_dist_vj = NULL,
-                                    cdr3_pssm = NULL, pssm_weight = 0.5) {
+                                    n = 5, len_dist = NULL,
+                                    cdr3_pssm = NULL, mut_weight = 0) {
   key <- paste0(v_seg, "_", j_seg)
   if (!key %in% names(cdr3_baseline[[chain]])) return(character(0))
 
   vj_counts         <- cdr3_baseline[[chain]][[key]]
   lengths_available <- names(vj_counts)
 
-  active_len_dist <- if (!is.null(len_dist_vj) && key %in% names(len_dist_vj)) {
-    len_dist_vj[[key]]
-  } else {
-    len_dist
-  }
-
+  # Sample n lengths WITH replacement from the marginal enriched length
+  # distribution (excess-over-background shrunk to the baseline length prior),
+  # so a strongly enriched length yields multiple CDR3s. Weights are enrichment,
+  # not baseline abundance, so rare-enriched lengths are favoured.
+  active_len_dist <- len_dist
   if (!is.null(active_len_dist)) {
     valid_lens <- intersect(names(active_len_dist), lengths_available)
     if (length(valid_lens) > 0) {
       probs         <- unlist(active_len_dist[valid_lens])
       probs         <- probs / sum(probs)
-      selected_lens <- sample(valid_lens, size = min(n, length(valid_lens)),
-                              replace = FALSE, prob = probs)
+      selected_lens <- sample(valid_lens, size = n, replace = TRUE, prob = probs)
     } else {
-      selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
+      selected_lens <- sample(lengths_available, size = n, replace = TRUE)
     }
   } else {
-    selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
+    selected_lens <- sample(lengths_available, size = n, replace = TRUE)
   }
 
   seqs <- vapply(selected_lens, function(len_name) {
@@ -387,24 +389,26 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
       if (sum(col) == 0) rep(1 / nrow(count_mat), nrow(count_mat))
       else               col / sum(col)
     })
-    # Per-position weight (IC-modulated): trust the PSSM more where the
-    # baseline is uninformative (low IC — the variable junction) and less
-    # where the baseline is conserved (high IC — the anchors). IC is computed
-    # from the normalized baseline column, so the weight is scale-free
-    # (independent of baseline depth M and of the number of top binders).
-    #   w(pos) = pssm_weight * (1 - IC_baseline(pos) / log2(K))
-    # with IC_baseline(pos) = log2(K) - H(pos), K = alphabet size.
+
+    # Per-position baseline information content, used by BOTH the PSSM blend and
+    # the IC-adjusted mutation. Scale-free (computed from the normalized baseline
+    # column): IC_baseline(pos) = log2(K) - H(pos), K = alphabet size.
+    max_ic <- log2(nrow(prob_mat))                     # log2(K); K = 20 for AAs
+    ic_pos <- apply(prob_mat, 2, function(col) {
+      p <- col[col > 0]
+      max_ic + sum(p * log2(p))                        # = max_ic - H(col)
+    })
+
+    # (3) PSSM blend at FULL weight (former PSSM_WEIGHT = 1, hardcoded): at low-IC
+    # junction positions the PSSM replaces the baseline; at high-IC anchors the
+    # weight -> 0, so the conserved C...F framework stays baseline-governed.
+    #   w(pos) = 1 - IC_baseline(pos) / log2(K)
     if (!is.null(cdr3_pssm) && !is.null(cdr3_pssm[[len_name]])) {
       pssm      <- cdr3_pssm[[len_name]]
       aa_common <- intersect(rownames(prob_mat), rownames(pssm))
       if (length(aa_common) >= 10 && ncol(pssm) == ncol(prob_mat)) {
-        max_ic <- log2(nrow(prob_mat))                 # log2(K); K = 20 for AAs
-        ic_pos <- apply(prob_mat, 2, function(col) {
-          p <- col[col > 0]
-          max_ic + sum(p * log2(p))                    # = max_ic - H(col)
-        })
-        w_pos <- pssm_weight * (1 - ic_pos / max_ic)   # per-position PSSM weight
-        w_pos <- pmax(0, pmin(pssm_weight, w_pos))     # numerical safety
+        w_pos <- 1 - ic_pos / max_ic                   # per-position PSSM weight
+        w_pos <- pmax(0, pmin(1, w_pos))               # numerical safety
         for (pos in seq_len(ncol(prob_mat))) {
           prob_mat[aa_common, pos] <- (1 - w_pos[pos]) * prob_mat[aa_common, pos] +
                                             w_pos[pos]  * pssm[aa_common, pos]
@@ -412,6 +416,22 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
         prob_mat <- apply(prob_mat, 2, function(col) col / sum(col))
       }
     }
+
+    # (4) IC-adjusted random mutation: mix a uniform component into each position
+    # so residues ABSENT from the V/J baseline can be proposed. IC-modulated like
+    # the PSSM blend (strong at the variable junction, ~0 at anchors), gated on
+    # the *baseline* IC so a peaked PSSM from few top binders can't suppress it.
+    # Selection (ESMFold) decides which mutations persist. mut_weight = 0 = off.
+    if (mut_weight > 0) {
+      unif  <- rep(1 / nrow(prob_mat), nrow(prob_mat))  # uniform over AA alphabet
+      m_pos <- mut_weight * (1 - ic_pos / max_ic)       # per-position mutation rate
+      m_pos <- pmax(0, pmin(mut_weight, m_pos))
+      for (pos in seq_len(ncol(prob_mat))) {
+        prob_mat[, pos] <- (1 - m_pos[pos]) * prob_mat[, pos] + m_pos[pos] * unif
+      }
+      prob_mat <- apply(prob_mat, 2, function(col) col / sum(col))
+    }
+
     amino_acids <- rownames(prob_mat)
     seq_vec <- sapply(seq_len(ncol(prob_mat)), function(pos) {
       p <- prob_mat[, pos]
@@ -427,8 +447,8 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
 
 
 sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file,
-                                     n = 5, len_dist = NULL, len_dist_vj = NULL,
-                                     cdr3_pssm = NULL, pssm_weight = 0.5) {
+                                     n = 5, len_dist = NULL,
+                                     cdr3_pssm = NULL, mut_weight = 0) {
   df           <- read.csv(pair_file)
   chain_letter <- sub("^TR", "", chain)
   v_col        <- paste0("TR", chain_letter, "V")
@@ -439,9 +459,8 @@ sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file
                     MoreArgs = list(cdr3_baseline = cdr3_baseline,
                                    n           = n,
                                    len_dist    = len_dist,
-                                   len_dist_vj = len_dist_vj,
                                    cdr3_pssm   = cdr3_pssm,
-                                   pssm_weight = pssm_weight),
+                                   mut_weight  = mut_weight),
                     SIMPLIFY = FALSE)
 
   df_exp <- data.frame(
@@ -488,73 +507,104 @@ load_esm_scores <- function(scores_file, model_file, score_col = SCORE_COL) {
 # Module 5 — Enrichment helpers (per-chain)
 # =============================================================================
 
-# Repertoire V/J prior P_baseline(V, J), straight from MixTCRviz's
-# precomputed joint V/J frequency matrix (already normalized to sum to 1).
-# Returns a named list over "TRAV_TRAJ" pair strings.
-extract_vj_baseline_prior <- function(chain_letter) {
-  chain_full <- paste0("TR", chain_letter)
-  m <- baseline_HomoSapiens$countVJ[[chain_full]]
-  v <- as.vector(m)
-  names(v) <- outer(rownames(m), colnames(m), paste, sep = "_")
-  as.list(v[v > 0])
+# Functional (gene_type == "F") gene names per gene, from the same reference
+# tables step 0 uses. Non-functional genes (pseudogenes / ORF / orphons) are
+# present in the baseline but must never enter the enrichment steps.
+load_functional_genes <- function(input_dir) {
+  genes <- c("TRAV", "TRAJ", "TRBV", "TRBJ")
+  setNames(lapply(genes, function(g) {
+    df <- read.csv(file.path(input_dir, paste0(g, ".csv")))
+    df[df$gene_type == "F", 1]
+  }), genes)
+}
+
+# Marginal repertoire priors P_baseline(V) and P_baseline(J) per chain, from the
+# joint countVJ matrix (row/col sums), restricted to functional genes.
+extract_vj_marginal_prior <- function(chain_letter, functional) {
+  m  <- baseline_HomoSapiens$countVJ[[paste0("TR", chain_letter)]]
+  pv <- rowSums(m); pj <- colSums(m)
+  fv <- functional[[paste0("TR", chain_letter, "V")]]
+  fj <- functional[[paste0("TR", chain_letter, "J")]]
+  pv <- pv[names(pv) %in% fv & pv > 0]
+  pj <- pj[names(pj) %in% fj & pj > 0]
+  list(V = pv / sum(pv), J = pj / sum(pj))
+}
+
+# Marginal baseline CDR3-length prior P_baseline(L) per chain, pooled over all
+# V/J pairs in countCDR3.VJL. Keys are "L_<n>" (matching lengths_available).
+extract_len_baseline_prior <- function(chain_letter) {
+  vj_list <- baseline_HomoSapiens$countCDR3.VJL[[paste0("TR", chain_letter)]]
+  len_counts <- list()
+  for (key in names(vj_list)) for (l in names(vj_list[[key]])) {
+    cnt <- sum(vj_list[[key]][[l]][, 1])   # n CDR3s of length l for this V/J
+    len_counts[[l]] <- (if (is.null(len_counts[[l]])) 0 else len_counts[[l]]) + cnt
+  }
+  v <- unlist(len_counts); v <- v[v > 0]
+  as.list(v / sum(v))
 }
 
 
-# Evidence-weighted, enrichment-based, baseline-shrunk V/J distribution.
-#   evidence(VJ)   = max(0, n_top(VJ) - n_all(VJ) * p_global)   [excess over
-#                    background pass rate — a VJ passing at exactly the
-#                    background rate contributes ~0 evidence, so it gets no
-#                    boost from raw passer counts alone]
-#   posterior(VJ) ∝ alpha * P_baseline(VJ) + evidence(VJ)        [Dirichlet/
-#                    empirical-Bayes shrinkage toward the repertoire prior,
-#                    weighted by how much evidence has accumulated]
-# Restricted to V/J pairs present in vj_baseline_prior, since those are the
-# only ones we can later draw CDR3 sequences for.
-extract_vj_dist_chain_shrunk <- function(top_tcrs, scored, chain_letter, vj_baseline_prior, alpha) {
+# Factorized, evidence-weighted, baseline-shrunk V/J distribution.
+# The joint (V,J) enrichment is empirically ~fully explained by the product of
+# the marginal V and J effects (interaction ≈ 1), so V and J are modelled
+# INDEPENDENTLY. This credits enrichment to the gene that earned it and stops an
+# enriched V from dragging an unspecific "passenger" J along (and vice versa).
+# Per gene:
+#   excess(g)    = max(0, n_top(g) - n_all(g) * p_global)   [excess over background]
+#   posterior(g) ∝ alpha * P_baseline(g) + excess(g)        [shrink to marginal prior]
+# Restricted to functional genes (marginal_prior names). Returns list(V, J) or NULL.
+extract_vj_marginal_posterior <- function(top_tcrs, scored, chain_letter, marginal_prior, alpha) {
   v_col <- paste0("TR", chain_letter, "V")
   j_col <- paste0("TR", chain_letter, "J")
   if (!all(c(v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
+  if (nrow(scored) == 0) return(NULL)
+  p_global <- nrow(top_tcrs) / nrow(scored)
 
-  key_of <- function(df) {
-    keep <- !is.na(df[[v_col]]) & !is.na(df[[j_col]])
-    paste(df[[v_col]][keep], df[[j_col]][keep], sep = "_")
+  post <- function(gene_col, prior) {
+    n_top <- table(top_tcrs[[gene_col]][!is.na(top_tcrs[[gene_col]])])
+    n_all <- table(scored[[gene_col]][!is.na(scored[[gene_col]])])
+    genes <- names(prior)
+    excess <- vapply(genes, function(g) {
+      nt <- if (g %in% names(n_top)) n_top[[g]] else 0
+      na <- if (g %in% names(n_all)) n_all[[g]] else 0
+      max(0, nt - na * p_global)
+    }, numeric(1))
+    posterior <- alpha * unlist(prior) + excess
+    if (sum(posterior) == 0) return(NULL)
+    posterior / sum(posterior)
   }
-  top_keys <- key_of(top_tcrs)
-  all_keys <- key_of(scored)
-  if (length(all_keys) == 0) return(NULL)
 
-  n_top    <- table(top_keys)
-  n_all    <- table(all_keys)
-  p_global <- length(top_keys) / length(all_keys)
-
-  vj_pairs <- names(vj_baseline_prior)
-  evidence <- sapply(vj_pairs, function(vj) {
-    nt <- if (vj %in% names(n_top)) n_top[[vj]] else 0
-    na <- if (vj %in% names(n_all)) n_all[[vj]] else 0
-    max(0, nt - na * p_global)
-  })
-
-  prior     <- unlist(vj_baseline_prior[vj_pairs])
-  posterior <- alpha * prior + evidence
-  if (sum(posterior) == 0) return(NULL)
-  as.list(posterior / sum(posterior))
+  pv <- post(v_col, marginal_prior$V)
+  pj <- post(j_col, marginal_prior$J)
+  if (is.null(pv) || is.null(pj)) return(NULL)
+  list(V = pv, J = pj)
 }
 
 
-sample_vj_pairs <- function(vj_dist, chain_letter, n_pairs, output_dir) {
+# Sample n_pairs (V, J) from the FACTORIZED distribution:
+#   P_sample(v, j) ∝ posterior_V(v) * posterior_J(j) * 1[(v,j) has a CDR3 baseline]
+# V and J drawn by their own marginal enrichment, combined only into pairs the
+# reference repertoire actually observed (generable and, since posteriors are
+# functional-only, functional).
+sample_vj_pairs <- function(vj_dist, chain_letter, n_pairs, output_dir, cdr3_baseline) {
   v_col <- paste0("TR", chain_letter, "V")
   j_col <- paste0("TR", chain_letter, "J")
   if (is.null(vj_dist))
     stop(sprintf("No V/J distribution available for chain TR%s.", chain_letter))
 
-  sampled  <- sample(names(vj_dist), size = n_pairs, replace = TRUE,
-                     prob = unlist(vj_dist))
-  split_vj <- strsplit(sampled, "_")
-  pairs    <- data.frame(
-    V = sapply(split_vj, `[`, 1),
-    J = sapply(split_vj, `[`, 2),
-    stringsAsFactors = FALSE
-  )
+  keys    <- names(cdr3_baseline[[paste0("TR", chain_letter)]])
+  split_k <- strsplit(keys, "_")
+  vg      <- vapply(split_k, `[`, character(1), 1)
+  jg      <- vapply(split_k, `[`, character(1), 2)
+  ok      <- vg %in% names(vj_dist$V) & jg %in% names(vj_dist$J)
+  if (!any(ok))
+    stop(sprintf("No valid functional V/J pairs with a CDR3 baseline for chain TR%s.", chain_letter))
+  vg <- vg[ok]; jg <- jg[ok]
+
+  w   <- as.numeric(vj_dist$V[vg]) * as.numeric(vj_dist$J[jg])   # factorized weight per pair
+  idx <- sample(seq_along(w), size = n_pairs, replace = TRUE, prob = w / sum(w))
+
+  pairs <- data.frame(vg[idx], jg[idx], stringsAsFactors = FALSE)
   colnames(pairs) <- c(v_col, j_col)
   write.csv(pairs, file.path(output_dir, paste0(v_col, "_", j_col, ".csv")),
             row.names = FALSE)
@@ -562,61 +612,33 @@ sample_vj_pairs <- function(vj_dist, chain_letter, n_pairs, output_dir) {
 }
 
 
-extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter) {
+# Marginal CDR3-length distribution, same excess-over-background + baseline
+# shrinkage as the V/J marginals (a raw freq_top/freq_all ratio blows up at rare
+# lengths and, with with-replacement length sampling, hijacks generation toward
+# spurious extreme lengths):
+#   posterior(L) ∝ alpha * P_baseline_len(L) + max(0, n_top(L) - n_all(L) * p_global)
+# alpha = len_prior_strength. Returns a named list over "L_<n>" keys.
+extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter, len_baseline_prior, alpha) {
   cdr3_col <- paste0("cdr3_TR", chain_letter)
   if (!cdr3_col %in% colnames(top_tcrs)) return(NULL)
 
-  freq_top <- table(paste0("L_", nchar(top_tcrs[[cdr3_col]][!is.na(top_tcrs[[cdr3_col]])])))
-  freq_all <- table(paste0("L_", nchar(scored[[cdr3_col]][!is.na(scored[[cdr3_col]])])))
-  if (sum(freq_top) == 0 || sum(freq_all) == 0) return(NULL)
+  Lt <- nchar(top_tcrs[[cdr3_col]][!is.na(top_tcrs[[cdr3_col]])])
+  La <- nchar(scored[[cdr3_col]][!is.na(scored[[cdr3_col]])])
+  if (length(Lt) == 0 || length(La) == 0) return(NULL)
 
-  freq_top <- freq_top / sum(freq_top)
-  freq_all <- freq_all / sum(freq_all)
-  all_lens <- union(names(freq_top), names(freq_all))
-  ratio <- sapply(all_lens, function(l) {
-    top_f <- if (l %in% names(freq_top)) as.numeric(freq_top[l]) else 0
-    all_f <- if (l %in% names(freq_all)) as.numeric(freq_all[l]) else 0
-    if (all_f == 0) return(0)
-    top_f / all_f
-  })
-  ratio <- ratio[ratio > 0]
-  if (sum(ratio) == 0) return(NULL)
-  as.list(ratio / sum(ratio))
-}
+  n_top    <- table(paste0("L_", Lt))
+  n_all    <- table(paste0("L_", La))
+  p_global <- length(Lt) / length(La)
 
-
-extract_cdr3_len_dist_vj <- function(top_tcrs, scored, chain_letter) {
-  cdr3_col <- paste0("cdr3_TR", chain_letter)
-  v_col    <- paste0("TR", chain_letter, "V")
-  j_col    <- paste0("TR", chain_letter, "J")
-  if (!all(c(cdr3_col, v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
-
-  prep <- function(df) {
-    keep <- !is.na(df[[cdr3_col]]) & !is.na(df[[v_col]]) & !is.na(df[[j_col]])
-    df   <- df[keep, ]
-    split(paste0("L_", nchar(df[[cdr3_col]])), paste0(df[[v_col]], "_", df[[j_col]]))
-  }
-  top_by_vj <- prep(top_tcrs)
-  all_by_vj <- prep(scored)
-  if (length(top_by_vj) == 0) return(NULL)
-
-  lapply(setNames(names(top_by_vj), names(top_by_vj)), function(vj) {
-    l_top    <- top_by_vj[[vj]]
-    l_all    <- if (vj %in% names(all_by_vj)) all_by_vj[[vj]] else character(0)
-    freq_top <- table(l_top) / length(l_top)
-    if (length(l_all) == 0) return(as.list(freq_top / sum(freq_top)))
-    freq_all <- table(l_all) / length(l_all)
-    all_lens <- union(names(freq_top), names(freq_all))
-    ratio <- sapply(all_lens, function(l) {
-      top_f <- if (l %in% names(freq_top)) as.numeric(freq_top[l]) else 0
-      all_f <- if (l %in% names(freq_all)) as.numeric(freq_all[l]) else 0
-      if (all_f == 0) return(0)
-      top_f / all_f
-    })
-    ratio <- ratio[ratio > 0]
-    if (sum(ratio) == 0) return(NULL)
-    as.list(ratio / sum(ratio))
-  })
+  lens   <- names(len_baseline_prior)
+  excess <- vapply(lens, function(l) {
+    nt <- if (l %in% names(n_top)) n_top[[l]] else 0
+    na <- if (l %in% names(n_all)) n_all[[l]] else 0
+    max(0, nt - na * p_global)
+  }, numeric(1))
+  posterior <- alpha * unlist(len_baseline_prior) + excess
+  if (sum(posterior) == 0) return(NULL)
+  as.list(posterior / sum(posterior))
 }
 
 
@@ -764,9 +786,10 @@ run_step0 <- function(peptide, mhc_allele, label, cdr3_baseline,
 # Returns top_tcrs (filtered) or NULL if too few binders.
 enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, species,
                               base_output_dir, cdr3_baseline,
-                              n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
+                              n_pairs, n_cdr3_multi, mut_weight, min_tcrs_pssm,
                               vj_baseline_prior, vj_prior_strength,
-                              threshold, len_dist_conditioned_on_vj = LEN_DIST_COND_VJ) {
+                              len_baseline_prior, len_prior_strength,
+                              threshold) {
 
   chain_name    <- if (chain_letter == "A") "alpha" else "beta"
   prev_step_dir <- file.path(base_output_dir, label, sprintf("step%d", step - 1))
@@ -795,19 +818,17 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
     return(NULL)
   }
 
-  # (1) V/J distribution: enrichment evidence shrunk toward repertoire baseline
-  vj_dist <- extract_vj_dist_chain_shrunk(top_tcrs, scored, chain_letter,
-                                          vj_baseline_prior[[chain_letter]], vj_prior_strength)
-  sample_vj_pairs(vj_dist, chain_letter, n_pairs, step_dir)
+  # (1) V/J distribution: factorized marginal enrichment (V and J independent),
+  # each shrunk toward the functional-only marginal prior; pairs formed only from
+  # combinations that have a CDR3 baseline.
+  vj_dist <- extract_vj_marginal_posterior(top_tcrs, scored, chain_letter,
+                                           vj_baseline_prior[[chain_letter]], vj_prior_strength)
+  sample_vj_pairs(vj_dist, chain_letter, n_pairs, step_dir, cdr3_baseline)
 
-  # (2) CDR3 length distribution (relative enrichment: top binders vs all scored)
-  if (len_dist_conditioned_on_vj) {
-    len_dist    <- NULL
-    len_dist_vj <- extract_cdr3_len_dist_vj(top_tcrs, scored, chain_letter)
-  } else {
-    len_dist    <- extract_cdr3_len_dist(top_tcrs, scored, chain_letter)
-    len_dist_vj <- NULL
-  }
+  # (2) Marginal CDR3 length distribution (excess-over-background shrunk to the
+  # baseline length prior, strength = len_prior_strength)
+  len_dist <- extract_cdr3_len_dist(top_tcrs, scored, chain_letter,
+                                    len_baseline_prior[[chain_letter]], len_prior_strength)
 
   # (3) PSSM from top binders' CDR3s
   cdr3_col <- paste0("cdr3_TR", chain_letter)
@@ -824,8 +845,8 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   pair_file <- file.path(step_dir, sprintf("TR%sV_TR%sJ.csv", chain_letter, chain_letter))
   cdr3_file <- file.path(step_dir, sprintf("TR%sV_TR%sJ_cdr3.csv", chain_letter, chain_letter))
   sample_chain_cdr3_multi(chain_tr, pair_file, cdr3_baseline, cdr3_file,
-                           n = n_cdr3_multi, len_dist = len_dist, len_dist_vj = len_dist_vj,
-                           cdr3_pssm = cdr3_pssm, pssm_weight = pssm_weight)
+                           n = n_cdr3_multi, len_dist = len_dist,
+                           cdr3_pssm = cdr3_pssm, mut_weight = mut_weight)
 
   df_chain  <- read.csv(cdr3_file)
   model_out <- file.path(step_dir, sprintf("model_%s.csv", chain_name))
@@ -841,10 +862,10 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
 
 run_enrich_step <- function(step, peptide, mhc_allele, label,
                              cdr3_baseline, base_output_dir,
-                             n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
+                             n_pairs, n_cdr3_multi, mut_weight, min_tcrs_pssm,
                              vj_baseline_prior, vj_prior_strength,
+                             len_baseline_prior, len_prior_strength,
                              esm_thresholds, species = "HomoSapiens",
-                             len_dist_conditioned_on_vj = LEN_DIST_COND_VJ,
                              plot_each_step     = PLOT_EACH_STEP,
                              validate_each_step = VALIDATE_EACH_STEP,
                              validation_file    = NULL, mhc = NULL) {
@@ -857,14 +878,16 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
 
   top_alpha <- enrich_one_chain("A", step, label, peptide, mhc_allele, species,
                                 base_output_dir, cdr3_baseline,
-                                n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
+                                n_pairs, n_cdr3_multi, mut_weight, min_tcrs_pssm,
                                 vj_baseline_prior, vj_prior_strength,
-                                threshold, len_dist_conditioned_on_vj)
+                                len_baseline_prior, len_prior_strength,
+                                threshold)
   top_beta  <- enrich_one_chain("B", step, label, peptide, mhc_allele, species,
                                 base_output_dir, cdr3_baseline,
-                                n_pairs, n_cdr3_multi, pssm_weight, min_tcrs_pssm,
+                                n_pairs, n_cdr3_multi, mut_weight, min_tcrs_pssm,
                                 vj_baseline_prior, vj_prior_strength,
-                                threshold, len_dist_conditioned_on_vj)
+                                len_baseline_prior, len_prior_strength,
+                                threshold)
 
   # Optional: MixTCRviz motif plots — saved into prev_step_dir (scores source)
   if (plot_each_step) {
@@ -962,9 +985,13 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
 # Main
 # =============================================================================
 
-baseline      <- MixTCRviz::baseline_HomoSapiens
-cdr3_baseline <- baseline$countCDR3.VJL
-vj_baseline_prior <- list(A = extract_vj_baseline_prior("A"), B = extract_vj_baseline_prior("B"))
+baseline         <- MixTCRviz::baseline_HomoSapiens
+cdr3_baseline    <- baseline$countCDR3.VJL
+functional_genes <- load_functional_genes(INPUT_DIR)   # gene_type == "F" only
+vj_baseline_prior  <- list(A = extract_vj_marginal_prior("A", functional_genes),
+                           B = extract_vj_marginal_prior("B", functional_genes))
+len_baseline_prior <- list(A = extract_len_baseline_prior("A"),
+                           B = extract_len_baseline_prior("B"))
 
 # Reference data for the full-sequence (fold.py) input CSVs (Module 0).
 ALLELES_SEQ <- load_alleles_seq()
@@ -1006,12 +1033,13 @@ for (epitope in epitopes) {
         base_output_dir            = BASE_OUTPUT_DIR,
         n_pairs                    = N_PAIRS,
         n_cdr3_multi               = N_CDR3_MULTI,
-        pssm_weight                = PSSM_WEIGHT,
+        mut_weight                 = MUT_WEIGHT,
         min_tcrs_pssm              = MIN_TCRS_PSSM,
         vj_baseline_prior          = vj_baseline_prior,
         vj_prior_strength          = VJ_PRIOR_STRENGTH,
+        len_baseline_prior         = len_baseline_prior,
+        len_prior_strength         = LEN_PRIOR_STRENGTH,
         esm_thresholds             = ESM_THRESHOLDS,
-        len_dist_conditioned_on_vj = LEN_DIST_COND_VJ,
         plot_each_step             = PLOT_EACH_STEP,
         validate_each_step         = VALIDATE_EACH_STEP,
         validation_file            = file.path(BASE_OUTPUT_DIR, label, "validation.csv"),
