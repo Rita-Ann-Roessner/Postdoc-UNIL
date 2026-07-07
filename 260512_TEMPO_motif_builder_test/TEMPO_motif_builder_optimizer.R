@@ -14,7 +14,7 @@ source("TEMPO_motif_builder_test.R", local = FALSE)
 # Working directory should be:
 # /Users/roessner/Documents/PostDoc/Data/260512_TEMPO_motif_builder_test
 
-OPTIMIZER_OUTPUT_DIR <- "optimizer_runs_prior"
+OPTIMIZER_OUTPUT_DIR <- "optimizer_runs"
 dir.create(OPTIMIZER_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # =============================================================================
@@ -26,8 +26,9 @@ dir.create(OPTIMIZER_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 eval_log <- data.frame()
 
-objective <- function(pssm_weight, decay_factor, vj_prior_strength) {
-  run_id  <- sprintf("pw%.2f_df%.3f_vj%.1f", pssm_weight, decay_factor, vj_prior_strength)
+objective <- function(mut_weight, decay_factor, vj_prior_strength, len_prior_strength) {
+  run_id  <- sprintf("mut%.3f_df%.3f_vj%.1f_len%.1f",
+                     mut_weight, decay_factor, vj_prior_strength, len_prior_strength)
   message(sprintf("\n>>> Evaluating: %s", run_id))
 
   res_list <- list()
@@ -44,10 +45,12 @@ objective <- function(pssm_weight, decay_factor, vj_prior_strength) {
         cdr3_baseline      = cdr3_baseline,
         known_binders_file = file.path(BASE_OUTPUT_DIR, epitope, paste0(epitope, ".csv")),
         validation_file    = file.path(BASE_OUTPUT_DIR, epitope, "validation.csv"),
-        pssm_weight        = pssm_weight,
+        mut_weight         = mut_weight,
         decay_factor       = decay_factor,
         vj_baseline_prior  = vj_baseline_prior,
+        len_baseline_prior = len_baseline_prior,
         vj_prior_strength  = vj_prior_strength,
+        len_prior_strength = len_prior_strength,
         plot_motif         = FALSE,
         plot_final_motif   = TRUE,
         validate_each_step = TRUE
@@ -70,10 +73,11 @@ objective <- function(pssm_weight, decay_factor, vj_prior_strength) {
   new_rows <- do.call(rbind, lapply(epitopes, function(ep) {
     res_p  <- res_list[[ep]]
     row <- data.frame(
-      run_id            = run_id,
-      pssm_weight       = pssm_weight,
-      decay_factor      = decay_factor,
-      vj_prior_strength = vj_prior_strength,
+      run_id             = run_id,
+      mut_weight         = mut_weight,
+      decay_factor       = decay_factor,
+      vj_prior_strength  = vj_prior_strength,
+      len_prior_strength = len_prior_strength,
       mean_auc01        = score,
       epitope      = ep,
       auc01        = auc01_vals[[ep]],
@@ -116,9 +120,10 @@ set.seed(42)
 bayes_result <- BayesianOptimization(
   FUN         = objective,
   bounds      = list(
-    pssm_weight       = c(0,    1),
-    decay_factor      = c(0.05, 0.9),
-    vj_prior_strength = c(0,    100)
+    mut_weight         = c(0,    0.3),
+    decay_factor       = c(0.05, 0.9),
+    vj_prior_strength  = c(0,    100),
+    len_prior_strength = c(0,    100)
   ),
   init_points = 8,
   n_iter      = 20,
@@ -135,9 +140,10 @@ bayes_result <- BayesianOptimization(
 
 best <- bayes_result$Best_Par
 message("\n===== Best parameters =====")
-message(sprintf("  PSSM_WEIGHT       = %.3f", best["pssm_weight"]))
-message(sprintf("  DECAY_FACTOR      = %.3f", best["decay_factor"]))
-message(sprintf("  VJ_PRIOR_STRENGTH = %.3f", best["vj_prior_strength"]))
+message(sprintf("  MUT_WEIGHT         = %.3f", best["mut_weight"]))
+message(sprintf("  DECAY_FACTOR       = %.3f", best["decay_factor"]))
+message(sprintf("  VJ_PRIOR_STRENGTH  = %.3f", best["vj_prior_strength"]))
+message(sprintf("  LEN_PRIOR_STRENGTH = %.3f", best["len_prior_strength"]))
 schedule <- INIT_PERC_RANK * best["decay_factor"]^(0:N_ITERATIONS)
 message(sprintf("  threshold schedule: %s",
                 paste(sprintf("%.3f", schedule), collapse = " -> ")))
