@@ -38,7 +38,7 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 0 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 3 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
@@ -47,7 +47,7 @@ SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = b
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
 #ESM_THRESHOLDS  <- c(0.5, 0.6, 0.7) #c(0.5, 0.6, 0.7, 0.7)
-ESM_THRESHOLDS  <- c(0.5, 0.6, 0.7)
+ESM_THRESHOLDS  <- c(0.5, 0.6, 0.65)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
@@ -365,22 +365,23 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
   vj_counts         <- cdr3_baseline[[chain]][[key]]
   lengths_available <- names(vj_counts)
 
-  # Sample n lengths WITH replacement from the marginal enriched length
-  # distribution (excess-over-background shrunk to the baseline length prior),
-  # so a strongly enriched length yields multiple CDR3s. Weights are enrichment,
-  # not baseline abundance, so rare-enriched lengths are favoured.
+  # Sample up to n DISTINCT lengths (each at most once) from the marginal enriched
+  # length distribution (excess-over-background shrunk to the baseline length
+  # prior). Weights decide *which* lengths are drawn — enrichment favours
+  # rare-but-real lengths — without over-concentrating multiple CDR3s on one length.
   active_len_dist <- len_dist
   if (!is.null(active_len_dist)) {
     valid_lens <- intersect(names(active_len_dist), lengths_available)
     if (length(valid_lens) > 0) {
       probs         <- unlist(active_len_dist[valid_lens])
       probs         <- probs / sum(probs)
-      selected_lens <- sample(valid_lens, size = n, replace = TRUE, prob = probs)
+      selected_lens <- sample(valid_lens, size = min(n, length(valid_lens)),
+                              replace = FALSE, prob = probs)
     } else {
-      selected_lens <- sample(lengths_available, size = n, replace = TRUE)
+      selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
     }
   } else {
-    selected_lens <- sample(lengths_available, size = n, replace = TRUE)
+    selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
   }
 
   seqs <- vapply(selected_lens, function(len_name) {
