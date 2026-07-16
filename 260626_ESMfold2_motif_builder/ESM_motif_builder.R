@@ -1001,6 +1001,11 @@ for (sp in c("HomoSapiens", "MusMusculus")) {
   if (dir.exists(file.path(MIXTCRVIZ_DATA, sp))) GENE_TABLES[[sp]] <- load_gene_tables(sp)
 }
 
+# Guard: skip the cluster-in-the-loop main run when sourced by the benchmark
+# harness (which only needs the functions + setup above).
+.run_main <- !exists(".sourced_for_benchmark") || !.sourced_for_benchmark
+if (.run_main) {
+
 auc_summary <- list()
 
 for (epitope in epitopes) {
@@ -1082,3 +1087,5 @@ if (identical(STEP, "final") && length(auc_summary) > 0) {
   }
   message(sprintf("  Saved to: %s", file.path(BASE_OUTPUT_DIR, "auc_summary.csv")))
 }
+
+}  # end .run_main guard (skipped when sourced with .sourced_for_benchmark <- TRUE)
