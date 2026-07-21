@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REMOTE=rroessne@curnagl
-REMOTE_BASE=/scratch/rroessne/260626_ESMfold2_motif_builder/benchmark
+REMOTE_BASE=/scratch/rroessne/260626_ESMfold2_motif_builder/benchmark_LEN
 
 step=step2
 

@@ -56,9 +56,21 @@ MUT_WEIGHT       <- 0.1    # IC-adjusted random-mutation rate: 0 = off; >0 mixes
                            # sites, ~0 at conserved anchors (affinity maturation). The PSSM
                            # blend is fixed to full weight at the junction (former PSSM_WEIGHT=1).
 MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
-VJ_PRIOR_STRENGTH  <- 30   # alpha: repertoire-prior pseudocount weight for V/J shrinkage
+VJ_PRIOR_STRENGTH  <- 60   # alpha: repertoire-prior pseudocount weight for V/J shrinkage
                            # (in evidence-count units; higher = more shrinkage toward baseline)
 LEN_PRIOR_STRENGTH <- 20   # beta: same idea, for the CDR3-length enrichment shrinkage
+
+FINAL_PERCENTILE <- 95  # final (STEP="final") top-binder cutoff = this percentile of the POOLED
+                        # (alpha+beta) score distribution of the LAST step — i.e. keep the top
+                        # (100 - N)% best-scoring TCRs of the final step. Epitope-adaptive.
+                        # NULL = use the fixed ESM_THRESHOLDS[N_STEPS] instead.
+
+CHAIN_WEIGHT <- "linear" # how TEMPO combines the two chains when scoring validation:
+                        # "equal"  = default TEMPO score (score_A + score_B, equal weight).
+                        # "sqrt"   = weight each chain by sqrt(n_passers): score = sqrt(n_A)*score_A
+                        #            + sqrt(n_B)*score_B (gentle; trusts the better-sampled chain).
+                        # "linear" = weight by the passer count itself: n_A*score_A + n_B*score_B
+                        #            (aggressive; can over-penalise a real but minority chain).
 
 PLOT_EACH_STEP     <- TRUE   # if TRUE, plot MixTCRviz motif after each enrichment step
 VALIDATE_EACH_STEP <- TRUE  # if TRUE, run TEMPO validation after each enrichment step
@@ -370,17 +382,17 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
   # prior). Weights decide *which* lengths are drawn — enrichment favours
   # rare-but-real lengths — without over-concentrating multiple CDR3s on one length.
   active_len_dist <- len_dist
-  if (!is.null(active_len_dist)) {
-    valid_lens <- intersect(names(active_len_dist), lengths_available)
-    if (length(valid_lens) > 0) {
-      probs         <- unlist(active_len_dist[valid_lens])
-      probs         <- probs / sum(probs)
-      selected_lens <- sample(valid_lens, size = min(n, length(valid_lens)),
-                              replace = FALSE, prob = probs)
-    } else {
-      selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
-    }
+  valid_lens <- if (!is.null(active_len_dist)) intersect(names(active_len_dist), lengths_available) else character(0)
+  probs      <- if (length(valid_lens) > 0) unlist(active_len_dist[valid_lens]) else numeric(0)
+
+  if (length(valid_lens) > 0 && sum(probs) > 0) {
+    probs         <- probs / sum(probs)
+    selected_lens <- sample(valid_lens, size = min(n, sum(probs > 0)),
+                            replace = FALSE, prob = probs)
   } else {
+    # No enriched length overlaps this V/J pair's available lengths — e.g.
+    # len_prior_strength = 0 can zero out every length this pair supports.
+    # Fall back to a uniform draw over the pair's available lengths.
     selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
   }
 
@@ -650,24 +662,43 @@ extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter, len_baseline_p
 # =============================================================================
 
 validate_motif <- function(motif_file, validation_file, output_dir,
-                            peptide, mhc, score_col = "score", plot = TRUE) {
+                            peptide, mhc, score_col = "score", plot = TRUE,
+                            chain_weight = CHAIN_WEIGHT) {
   dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
-  TEMPOtrain(
-    input.train      = motif_file,
-    input.pred       = validation_file,
-    output.path      = output_dir,
-    filename.train   = "motif_train",
-    filename.pred    = "validation_pred",
-    build.prank      = FALSE,
-    compute.prank    = FALSE,
-    write.data.pred  = TRUE,
-    write.data.train = FALSE,
-    write.predictor  = FALSE
-  )
 
-  pred_files <- list.files(output_dir, pattern = "^validation_pred", full.names = TRUE)
-  if (length(pred_files) == 0) stop("No validation output found in ", output_dir)
-  pred_df <- read.csv(pred_files[1])
+  # Score the validation set with a given chain model; use TEMPO's returned data
+  # frame directly (res$score with Label + score) — no disk glob, so there is no
+  # stale-file / locale-sort ambiguity.
+  score_chain <- function(ch) {
+    res <- TEMPOtrain(
+      input.train = motif_file, input.pred = validation_file, output.path = output_dir,
+      chain = ch, build.prank = FALSE, compute.prank = FALSE,
+      write.data.pred = FALSE, write.data.train = FALSE, write.predictor = FALSE,
+      return.object = TRUE)
+    res$score
+  }
+
+  if (chain_weight %in% c("sqrt", "linear")) {
+    # Weight chains by their motif passer counts: score = wA*score_A + wB*score_B,
+    # with wA/wB = n (linear) or sqrt(n) (gentler).
+    motif <- read.csv(motif_file)
+    nA <- sum(!is.na(motif$cdr3_TRA)); nB <- sum(!is.na(motif$cdr3_TRB))
+    wfun <- if (chain_weight == "sqrt") sqrt else identity
+    wA <- wfun(nA); wB <- wfun(nB)
+    dA <- score_chain("A"); dB <- score_chain("B")
+    if (nrow(dA) != nrow(dB))
+      stop("Per-chain prediction row counts differ (A=", nrow(dA), ", B=", nrow(dB), ").")
+    pred_df <- dA
+    pred_df[[score_col]] <- wA * dA[[score_col]] + wB * dB[[score_col]]
+    message(sprintf("  chain weights (%s): A=%.2f (n=%d)  B=%.2f (n=%d)", chain_weight, wA, nA, wB, nB))
+  } else {
+    # equal weight = default combined (AB) TEMPO score
+    pred_df <- score_chain("AB")
+  }
+
+  # Persist the final scored validation set (with the combined/weighted score in
+  # score_col) as a single file — written from memory, so no glob ambiguity.
+  write.csv(pred_df, file.path(output_dir, "validation_pred.csv"), row.names = FALSE)
 
   if (!"Label" %in% colnames(pred_df))
     stop("'Label' column not found in validation output; check that validation.csv has 'Label'.")
@@ -930,12 +961,30 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
 
 run_final_validation <- function(label, peptide, mhc, mhc_allele,
                                   base_output_dir, n_steps, esm_thresholds,
-                                  validation_file) {
+                                  validation_file,
+                                  final_percentile = FINAL_PERCENTILE) {
   last_step_dir <- file.path(base_output_dir, label, sprintf("step%d", n_steps))
-  threshold     <- esm_thresholds[n_steps]
 
-  message(sprintf("[%s] Final: loading step-%d ESM scores (threshold = %.2f)",
-                  label, n_steps, threshold))
+  # Final cutoff: either the fixed schedule value, or the Nth percentile of the
+  # POOLED (alpha+beta) score distribution of the LAST step — keep the top
+  # (100 - N)% best-scoring TCRs. Epitope-adaptive to the final pool.
+  if (!is.null(final_percentile)) {
+    last_scores <- unlist(lapply(c("alpha", "beta"), function(ch) {
+      f <- file.path(last_step_dir, sprintf("output_%s.csv", ch))
+      if (file.exists(f)) {
+        d <- read.csv(f, check.names = FALSE)
+        if (SCORE_COL %in% names(d)) d[[SCORE_COL]] else numeric(0)
+      } else numeric(0)
+    }))
+    if (length(last_scores) == 0)
+      stop(sprintf("[%s] Cannot compute percentile: no step-%d output scores.", label, n_steps))
+    threshold <- as.numeric(quantile(last_scores, final_percentile / 100, na.rm = TRUE))
+    message(sprintf("[%s] Final: threshold = %.3f (%gth pctile of pooled step-%d scores, n=%d)",
+                    label, threshold, final_percentile, n_steps, length(last_scores)))
+  } else {
+    threshold <- esm_thresholds[n_steps]
+    message(sprintf("[%s] Final: threshold = %.2f (fixed schedule)", label, threshold))
+  }
 
   collect_top <- function(chain_letter) {
     chain_name  <- if (chain_letter == "A") "alpha" else "beta"

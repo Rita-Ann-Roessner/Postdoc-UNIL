@@ -16,18 +16,21 @@
 .sourced_for_benchmark <- TRUE
 source("ESM_motif_builder.R")   # functions + config (epitopes, SCORE_COL); main loop skipped
 
-EVAL_DIR   <- "test"          # directory holding the grid trees (set to "benchmark" if that's where yours live)
+EVAL_DIR   <- "benchmark_LEN_top"          # directory holding the grid trees (set to "benchmark" if that's where yours live)
 STEPS      <- c(1, 2)         # steps to evaluate (those you have folded)
-TOP_N      <- 50              # take the TOP_N highest-scoring TCRs per chain (threshold-free)
+TOP_N      <- 50              # number of top scorers to keep (see POOL_CHAINS for per-chain vs pooled)
 FP_GENE    <- "TRBV25-1"      # false-positive V gene to track (beta chain)
 PLOT_MOTIF <- TRUE            # also write a MixTCRviz motif logo per grid point / step / chain
+POOL_CHAINS <- TRUE           # TRUE: pool alpha+beta by score and take the global TOP_N (the
+                              #   better-scoring chain gets more slots; TOP_N is the TOTAL).
+                              # FALSE: take TOP_N per chain separately (TOP_N per chain, as before).
 
-# Top-N highest scorers per chain (no threshold).
-top_n <- function(out_csv, model_csv, n) {
+# Load a chain's scored TCRs, tagged with .chain (NULL if not folded yet).
+load_chain <- function(out_csv, model_csv, tag) {
   if (!file.exists(out_csv) || !file.exists(model_csv)) return(NULL)
   sc <- load_esm_scores(out_csv, model_csv)
-  sc <- sc[order(sc[[SCORE_COL]], decreasing = TRUE), ]
-  head(sc, n)
+  sc$.chain <- tag
+  sc
 }
 
 # plot_step_motif (via MixTCRviz) writes <sd>/motif_<chain>/<Model_*>.pdf; flatten
@@ -56,9 +59,22 @@ for (gp_dir in list.dirs(EVAL_DIR, recursive = FALSE)) {
 
     for (s in STEPS) {
       sd <- file.path(gp_dir, ep, sprintf("step%d", s))
-      top_a <- top_n(file.path(sd, "output_alpha.csv"), file.path(sd, "model_alpha.csv"), TOP_N)
-      top_b <- top_n(file.path(sd, "output_beta.csv"),  file.path(sd, "model_beta.csv"),  TOP_N)
-      if (is.null(top_a) && is.null(top_b)) next   # step not folded yet
+      a  <- load_chain(file.path(sd, "output_alpha.csv"), file.path(sd, "model_alpha.csv"), "A")
+      b  <- load_chain(file.path(sd, "output_beta.csv"),  file.path(sd, "model_beta.csv"),  "B")
+      if (is.null(a) && is.null(b)) next   # step not folded yet
+
+      if (POOL_CHAINS) {
+        # pool both chains, take the global TOP_N by score -> the better-scoring
+        # chain gets more of the N slots (split reflects relative ipTM)
+        pool  <- do.call(rbind, Filter(Negate(is.null), list(a, b)))
+        pool  <- head(pool[order(pool[[SCORE_COL]], decreasing = TRUE), , drop = FALSE], TOP_N)
+        top_a <- pool[pool$.chain == "A", , drop = FALSE]
+        top_b <- pool[pool$.chain == "B", , drop = FALSE]
+      } else {
+        # TOP_N per chain separately (forces an equal A/B split)
+        top_a <- if (!is.null(a)) head(a[order(a[[SCORE_COL]], decreasing = TRUE), , drop = FALSE], TOP_N) else NULL
+        top_b <- if (!is.null(b)) head(b[order(b[[SCORE_COL]], decreasing = TRUE), , drop = FALSE], TOP_N) else NULL
+      }
 
       # motif AUC (TEMPO-validated)
       auc <- NA_real_; auc01 <- NA_real_
@@ -89,7 +105,7 @@ for (gp_dir in list.dirs(EVAL_DIR, recursive = FALSE)) {
       }
 
       rows[[length(rows) + 1]] <- data.frame(
-        vj = vj, len = len, epitope = ep, step = s, top_n = TOP_N,
+        vj = vj, len = len, epitope = ep, step = s, top_n = TOP_N, pooled = POOL_CHAINS,
         n_top_a = if (is.null(top_a)) NA_integer_ else nrow(top_a),
         n_top_b = if (is.null(top_b)) NA_integer_ else nrow(top_b),
         auc = auc, auc01 = auc01,
