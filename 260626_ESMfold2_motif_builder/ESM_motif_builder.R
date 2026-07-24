@@ -51,10 +51,12 @@ ESM_THRESHOLDS  <- c(0.5, 0.6, 0.65)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
-MUT_WEIGHT       <- 0.1    # IC-adjusted random-mutation rate: 0 = off; >0 mixes a uniform
-                           # component into each CDR3 position, strongest at low-IC (variable)
-                           # sites, ~0 at conserved anchors (affinity maturation). The PSSM
-                           # blend is fixed to full weight at the junction (former PSSM_WEIGHT=1).
+MUT_WEIGHT       <- 0.1    # IC-adjusted diversification strength: 0 = off; >0 applies a
+                           # Dirichlet perturbation that randomly re-emphasises amino acids
+                           # ALREADY present in the baseline/PSSM blend (support preserved —
+                           # no novel residues), strongest at low-IC (variable) sites, ~0 at
+                           # conserved anchors. The PSSM blend is fixed to full weight at the
+                           # junction (former PSSM_WEIGHT=1).
 MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
 VJ_PRIOR_STRENGTH  <- 60   # alpha: repertoire-prior pseudocount weight for V/J shrinkage
                            # (in evidence-count units; higher = more shrinkage toward baseline)
@@ -430,17 +432,37 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
       }
     }
 
-    # (4) IC-adjusted random mutation: mix a uniform component into each position
-    # so residues ABSENT from the V/J baseline can be proposed. IC-modulated like
-    # the PSSM blend (strong at the variable junction, ~0 at anchors), gated on
-    # the *baseline* IC so a peaked PSSM from few top binders can't suppress it.
-    # Selection (ESMFold) decides which mutations persist. mut_weight = 0 = off.
+    # (4) IC-adjusted Dirichlet perturbation: randomly re-emphasise amino acids
+    # ALREADY present in the blend by drawing the per-position distribution from
+    # Dirichlet(alpha * P_blend). Support is preserved (an AA with p = 0 gets
+    # shape 0 -> stays 0), so this diversifies WITHIN the observed alphabet only —
+    # no novel residues, no uniform noise. IC-gated on the *baseline* IC like the
+    # PSSM blend (strong at the variable junction, ~0 at conserved anchors) so a
+    # peaked PSSM from few top binders can't over-concentrate the junction.
+    # Selection (ESMFold) decides which variants persist. mut_weight = 0 = off.
+    #   s_pos = mut_weight * (1 - IC/log2K)     per-position perturbation strength
+    #   alpha = (1 - s_pos) / s_pos             Dirichlet concentration:
+    #             s->0  => alpha->Inf => distribution unchanged (anchors)
+    #             s=0.1 => alpha=9    => mild reshuffle around the blend
+    #             s->1  => alpha->0   => single blend-weighted residue (max diversify)
     if (mut_weight > 0) {
-      unif  <- rep(1 / nrow(prob_mat), nrow(prob_mat))  # uniform over AA alphabet
-      m_pos <- mut_weight * (1 - ic_pos / max_ic)       # per-position mutation rate
-      m_pos <- pmax(0, pmin(mut_weight, m_pos))
+      s_pos <- mut_weight * (1 - ic_pos / max_ic)
+      s_pos <- pmax(0, pmin(1, s_pos))
       for (pos in seq_len(ncol(prob_mat))) {
-        prob_mat[, pos] <- (1 - m_pos[pos]) * prob_mat[, pos] + m_pos[pos] * unif
+        s <- s_pos[pos]
+        if (s <= 0) next                                    # anchor: no perturbation
+        p     <- prob_mat[, pos]
+        alpha <- (1 - s) / s                                # total Dirichlet concentration
+        g     <- rgamma(length(p), shape = alpha * p, rate = 1)  # p_i = 0 -> 0 (support kept)
+        if (sum(g) > 0) {
+          prob_mat[, pos] <- g / sum(g)
+        } else {
+          # alpha -> 0 numerical underflow: realise the Dirichlet limit explicitly
+          # (all mass on one residue, drawn proportional to the blend).
+          pick <- sample.int(length(p), 1, prob = p)
+          v <- numeric(length(p)); v[pick] <- 1
+          prob_mat[, pos] <- v
+        }
       }
       prob_mat <- apply(prob_mat, 2, function(col) col / sum(col))
     }

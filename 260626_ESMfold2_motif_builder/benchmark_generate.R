@@ -17,13 +17,13 @@
 source("ESM_motif_builder.R")   # functions + setup (priors, gene tables); main loop skipped
 
 # ---- Benchmark configuration ------------------------------------------------
-BENCH_DIR     <- "benchmark_MUT"
+BENCH_DIR     <- "benchmark_MUT_v2"
 # Sweep VJ, LEN, MUT, or any combination: a vector sweeps that knob, a scalar
 # fixes it. When several are vectors the nested loops below generate the full
 # VJ x LEN x MUT grid.
 GRID_VJ       <- 60                     # VJ_PRIOR_STRENGTH (fixed at the VJ-sweep winner)
 GRID_LEN      <- 20          # LEN_PRIOR_STRENGTH sweep
-GRID_MUT      <- c(0, 0.2, 0.5, 1) # MUT_WEIGHT sweep (fraction, e.g. c(0, 0.1, 0.2))
+GRID_MUT      <- c(0, 0.1, 0.2, 0.5, 1) # MUT_WEIGHT sweep (fraction, e.g. c(0, 0.1, 0.2))
 BENCH_N_PAIRS <- 400                    # smaller than the full-run N_PAIRS to cut folds
 SRC_DIR       <- BASE_OUTPUT_DIR        # "TCR_motif_atlas" — source of the shared step0
 
