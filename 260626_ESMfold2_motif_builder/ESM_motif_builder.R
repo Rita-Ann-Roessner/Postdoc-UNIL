@@ -51,12 +51,6 @@ ESM_THRESHOLDS  <- c(0.5, 0.6, 0.65)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
-MUT_WEIGHT       <- 0.1    # IC-adjusted diversification strength: 0 = off; >0 applies a
-                           # Dirichlet perturbation that randomly re-emphasises amino acids
-                           # ALREADY present in the baseline/PSSM blend (support preserved —
-                           # no novel residues), strongest at low-IC (variable) sites, ~0 at
-                           # conserved anchors. The PSSM blend is fixed to full weight at the
-                           # junction (former PSSM_WEIGHT=1).
 MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
 VJ_PRIOR_STRENGTH  <- 60   # alpha: repertoire-prior pseudocount weight for V/J shrinkage
                            # (in evidence-count units; higher = more shrinkage toward baseline)
@@ -372,7 +366,7 @@ build_cdr3_pssm <- function(cdr3_seqs, pseudocount = 0.1) {
 
 draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
                                     n = 5, len_dist = NULL,
-                                    cdr3_pssm = NULL, mut_weight = 0) {
+                                    cdr3_pssm = NULL) {
   key <- paste0(v_seg, "_", j_seg)
   if (!key %in% names(cdr3_baseline[[chain]])) return(character(0))
 
@@ -405,9 +399,9 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
       else               col / sum(col)
     })
 
-    # Per-position baseline information content, used by BOTH the PSSM blend and
-    # the IC-adjusted mutation. Scale-free (computed from the normalized baseline
-    # column): IC_baseline(pos) = log2(K) - H(pos), K = alphabet size.
+    # Per-position baseline information content, used by the PSSM blend. Scale-free
+    # (computed from the normalized baseline column):
+    #   IC_baseline(pos) = log2(K) - H(pos), K = alphabet size.
     max_ic <- log2(nrow(prob_mat))                     # log2(K); K = 20 for AAs
     ic_pos <- apply(prob_mat, 2, function(col) {
       p <- col[col > 0]
@@ -432,41 +426,6 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
       }
     }
 
-    # (4) IC-adjusted Dirichlet perturbation: randomly re-emphasise amino acids
-    # ALREADY present in the blend by drawing the per-position distribution from
-    # Dirichlet(alpha * P_blend). Support is preserved (an AA with p = 0 gets
-    # shape 0 -> stays 0), so this diversifies WITHIN the observed alphabet only —
-    # no novel residues, no uniform noise. IC-gated on the *baseline* IC like the
-    # PSSM blend (strong at the variable junction, ~0 at conserved anchors) so a
-    # peaked PSSM from few top binders can't over-concentrate the junction.
-    # Selection (ESMFold) decides which variants persist. mut_weight = 0 = off.
-    #   s_pos = mut_weight * (1 - IC/log2K)     per-position perturbation strength
-    #   alpha = (1 - s_pos) / s_pos             Dirichlet concentration:
-    #             s->0  => alpha->Inf => distribution unchanged (anchors)
-    #             s=0.1 => alpha=9    => mild reshuffle around the blend
-    #             s->1  => alpha->0   => single blend-weighted residue (max diversify)
-    if (mut_weight > 0) {
-      s_pos <- mut_weight * (1 - ic_pos / max_ic)
-      s_pos <- pmax(0, pmin(1, s_pos))
-      for (pos in seq_len(ncol(prob_mat))) {
-        s <- s_pos[pos]
-        if (s <= 0) next                                    # anchor: no perturbation
-        p     <- prob_mat[, pos]
-        alpha <- (1 - s) / s                                # total Dirichlet concentration
-        g     <- rgamma(length(p), shape = alpha * p, rate = 1)  # p_i = 0 -> 0 (support kept)
-        if (sum(g) > 0) {
-          prob_mat[, pos] <- g / sum(g)
-        } else {
-          # alpha -> 0 numerical underflow: realise the Dirichlet limit explicitly
-          # (all mass on one residue, drawn proportional to the blend).
-          pick <- sample.int(length(p), 1, prob = p)
-          v <- numeric(length(p)); v[pick] <- 1
-          prob_mat[, pos] <- v
-        }
-      }
-      prob_mat <- apply(prob_mat, 2, function(col) col / sum(col))
-    }
-
     amino_acids <- rownames(prob_mat)
     seq_vec <- sapply(seq_len(ncol(prob_mat)), function(pos) {
       p <- prob_mat[, pos]
@@ -483,7 +442,7 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
 
 sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file,
                                      n = 5, len_dist = NULL,
-                                     cdr3_pssm = NULL, mut_weight = 0) {
+                                     cdr3_pssm = NULL) {
   df           <- read.csv(pair_file)
   chain_letter <- sub("^TR", "", chain)
   v_col        <- paste0("TR", chain_letter, "V")
@@ -494,8 +453,7 @@ sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file
                     MoreArgs = list(cdr3_baseline = cdr3_baseline,
                                    n           = n,
                                    len_dist    = len_dist,
-                                   cdr3_pssm   = cdr3_pssm,
-                                   mut_weight  = mut_weight),
+                                   cdr3_pssm   = cdr3_pssm),
                     SIMPLIFY = FALSE)
 
   df_exp <- data.frame(
@@ -840,7 +798,7 @@ run_step0 <- function(peptide, mhc_allele, label, cdr3_baseline,
 # Returns top_tcrs (filtered) or NULL if too few binders.
 enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, species,
                               base_output_dir, cdr3_baseline,
-                              n_pairs, n_cdr3_multi, mut_weight, min_tcrs_pssm,
+                              n_pairs, n_cdr3_multi, min_tcrs_pssm,
                               vj_baseline_prior, vj_prior_strength,
                               len_baseline_prior, len_prior_strength,
                               threshold) {
@@ -900,7 +858,7 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   cdr3_file <- file.path(step_dir, sprintf("TR%sV_TR%sJ_cdr3.csv", chain_letter, chain_letter))
   sample_chain_cdr3_multi(chain_tr, pair_file, cdr3_baseline, cdr3_file,
                            n = n_cdr3_multi, len_dist = len_dist,
-                           cdr3_pssm = cdr3_pssm, mut_weight = mut_weight)
+                           cdr3_pssm = cdr3_pssm)
 
   df_chain  <- read.csv(cdr3_file)
   model_out <- file.path(step_dir, sprintf("model_%s.csv", chain_name))
@@ -916,7 +874,7 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
 
 run_enrich_step <- function(step, peptide, mhc_allele, label,
                              cdr3_baseline, base_output_dir,
-                             n_pairs, n_cdr3_multi, mut_weight, min_tcrs_pssm,
+                             n_pairs, n_cdr3_multi, min_tcrs_pssm,
                              vj_baseline_prior, vj_prior_strength,
                              len_baseline_prior, len_prior_strength,
                              esm_thresholds, species = "HomoSapiens",
@@ -932,13 +890,13 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
 
   top_alpha <- enrich_one_chain("A", step, label, peptide, mhc_allele, species,
                                 base_output_dir, cdr3_baseline,
-                                n_pairs, n_cdr3_multi, mut_weight, min_tcrs_pssm,
+                                n_pairs, n_cdr3_multi, min_tcrs_pssm,
                                 vj_baseline_prior, vj_prior_strength,
                                 len_baseline_prior, len_prior_strength,
                                 threshold)
   top_beta  <- enrich_one_chain("B", step, label, peptide, mhc_allele, species,
                                 base_output_dir, cdr3_baseline,
-                                n_pairs, n_cdr3_multi, mut_weight, min_tcrs_pssm,
+                                n_pairs, n_cdr3_multi, min_tcrs_pssm,
                                 vj_baseline_prior, vj_prior_strength,
                                 len_baseline_prior, len_prior_strength,
                                 threshold)
@@ -1110,7 +1068,6 @@ for (epitope in epitopes) {
         base_output_dir            = BASE_OUTPUT_DIR,
         n_pairs                    = N_PAIRS,
         n_cdr3_multi               = N_CDR3_MULTI,
-        mut_weight                 = MUT_WEIGHT,
         min_tcrs_pssm              = MIN_TCRS_PSSM,
         vj_baseline_prior          = vj_baseline_prior,
         vj_prior_strength          = VJ_PRIOR_STRENGTH,

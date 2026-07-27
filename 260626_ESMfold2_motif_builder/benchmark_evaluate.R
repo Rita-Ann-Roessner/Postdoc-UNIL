@@ -12,7 +12,7 @@
 .sourced_for_benchmark <- TRUE
 source("ESM_motif_builder.R")   # functions + config (ESM_THRESHOLDS, epitopes, SCORE_COL)
 
-BENCH_DIR  <- "benchmark_MUT"
+BENCH_DIR  <- "benchmark_MUT_v2"
 STEPS      <- c(1, 2)          # integer folded steps to evaluate
 FILTER     <- "threshold"    # "threshold": every step uses ESM_THRESHOLDS[s+1] (as before).
                               # "percentile": the LAST step uses the Nth-percentile cutoff of its
@@ -50,10 +50,9 @@ plot_motif_flat <- function(top, chain_letter, lab, s, sd) {
 rows <- list()
 for (gp_dir in list.dirs(BENCH_DIR, recursive = FALSE)) {
   gp <- basename(gp_dir)
-  if (!grepl("^vj[0-9]+_len[0-9]+_mut[0-9]+$", gp)) next
-  vj  <- as.integer(sub("^vj0*([0-9]+)_.*",       "\\1", gp))
-  len <- as.integer(sub(".*_len0*([0-9]+)_.*",    "\\1", gp))
-  mut <- as.integer(sub(".*_mut0*([0-9]+)$",      "\\1", gp)) / 1000   # basis points -> fraction
+  if (!grepl("^vj[0-9]+_len[0-9]+$", gp)) next
+  vj  <- as.integer(sub("^vj0*([0-9]+)_.*",  "\\1", gp))
+  len <- as.integer(sub(".*_len0*([0-9]+)$", "\\1", gp))
 
   for (ep in epitopes) {
     mhc <- sub("_.*", "", ep); peptide <- sub("^[^_]*_", "", ep)
@@ -92,7 +91,7 @@ for (gp_dir in list.dirs(BENCH_DIR, recursive = FALSE)) {
       # beta batch -> real beta (+ dummy alpha). Title carries the VJ value;
       # PDFs land in <grid>/<epitope>/step<s>/motif_{alpha,beta}/.
       if (PLOT_MOTIF) {
-        lab <- sprintf("%s VJ=%d LEN=%d MUT=%g", ep, vj, len, mut)
+        lab <- sprintf("%s VJ=%d LEN=%d", ep, vj, len)
         if (!is.null(top_a) && nrow(top_a) >= 10) plot_motif_flat(top_a, "A", lab, s, sd)
         if (!is.null(top_b) && nrow(top_b) >= 10) plot_motif_flat(top_b, "B", lab, s, sd)
       }
@@ -107,7 +106,7 @@ for (gp_dir in list.dirs(BENCH_DIR, recursive = FALSE)) {
       }
 
       rows[[length(rows) + 1]] <- data.frame(
-        vj = vj, len = len, mut = mut, epitope = ep, step = s,
+        vj = vj, len = len, epitope = ep, step = s,
         cutoff = if (FILTER == "percentile" && s == max(STEPS)) sprintf("p%g", PERCENTILE) else "thr",
         thr = round(thr, 3),
         n_top_a = if (is.null(top_a)) NA_integer_ else nrow(top_a),
@@ -126,7 +125,7 @@ if (length(rows) == 0) {
           " — run benchmark_generate.R, fold, gather, then re-run.")
 } else {
   summary <- do.call(rbind, rows)
-  summary <- summary[order(summary$epitope, summary$step, summary$vj, summary$len, summary$mut), ]
+  summary <- summary[order(summary$epitope, summary$step, summary$vj, summary$len), ]
   write.csv(summary, file.path(BENCH_DIR, "summary.csv"), row.names = FALSE)
   cat("\n===== Benchmark summary (VJ sweep) =====\n"); print(summary, row.names = FALSE)
   cat(sprintf("\nSaved to %s\n", file.path(BENCH_DIR, "summary.csv")))
