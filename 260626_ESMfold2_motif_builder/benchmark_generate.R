@@ -18,20 +18,24 @@ source("ESM_motif_builder.R")   # functions + setup (priors, gene tables); main 
 
 # ---- Benchmark configuration ------------------------------------------------
 BENCH_DIR     <- "benchmark_MUT_v2"
-# Sweep VJ, LEN, or both: a vector sweeps that knob, a scalar fixes it. When both
-# are vectors the double loop below generates the full VJ x LEN grid.
+# Sweep VJ, LEN, MUT, or any combination: a vector sweeps that knob, a scalar
+# fixes it. When several are vectors the nested loops below generate the full
+# VJ x LEN x MUT grid.
 GRID_VJ       <- 60                     # VJ_PRIOR_STRENGTH (fixed at the VJ-sweep winner)
 GRID_LEN      <- 20          # LEN_PRIOR_STRENGTH sweep
+GRID_MUT      <- c(0, 0.1, 0.2, 0.5, 1) # MUT_WEIGHT sweep (fraction; 0 = mutation off)
 BENCH_N_PAIRS <- 400                    # smaller than the full-run N_PAIRS to cut folds
 SRC_DIR       <- BASE_OUTPUT_DIR        # "TCR_motif_atlas" — source of the shared step0
 
 STEP <- suppressWarnings(as.integer(commandArgs(trailingOnly = TRUE)[1]))
 if (is.na(STEP)) STEP <- 2
 
-gp_name <- function(vj, len) sprintf("vj%03d_len%03d", vj, len)
+# mut is a fraction; encode it as integer basis points (0.1 -> 100) so grid dir
+# names stay integer-parseable (mut%03d): "vj060_len000_mut100".
+gp_name <- function(vj, len, mut) sprintf("vj%03d_len%03d_mut%03d", vj, len, round(mut * 1000))
 
-for (vj in GRID_VJ) for (len in GRID_LEN) {
-  gp     <- gp_name(vj, len)
+for (vj in GRID_VJ) for (len in GRID_LEN) for (mut in GRID_MUT) {
+  gp     <- gp_name(vj, len, mut)
   gp_dir <- file.path(BENCH_DIR, gp)
 
   for (ep in epitopes) {
@@ -54,8 +58,8 @@ for (vj in GRID_VJ) for (len in GRID_LEN) {
                 file.path(gp_dir, ep, "validation.csv"), overwrite = TRUE)
     }
 
-    message(sprintf("\n[grid %s | %s] generating step %d (VJ=%d, LEN=%d)",
-                    gp, ep, STEP, vj, len))
+    message(sprintf("\n[grid %s | %s] generating step %d (VJ=%d, LEN=%d, MUT=%g)",
+                    gp, ep, STEP, vj, len, mut))
     run_enrich_step(
       step               = STEP,
       peptide            = peptide,
@@ -65,6 +69,7 @@ for (vj in GRID_VJ) for (len in GRID_LEN) {
       base_output_dir    = gp_dir,
       n_pairs            = BENCH_N_PAIRS,
       n_cdr3_multi       = N_CDR3_MULTI,
+      mut_weight         = mut,            # <-- the swept knob
       min_tcrs_pssm      = MIN_TCRS_PSSM,
       vj_baseline_prior  = vj_baseline_prior,
       vj_prior_strength  = vj,            # <-- the swept knob

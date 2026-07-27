@@ -38,11 +38,11 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 3 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 1 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas" 
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_decoy_correction" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
@@ -55,6 +55,19 @@ MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
 VJ_PRIOR_STRENGTH  <- 60   # alpha: repertoire-prior pseudocount weight for V/J shrinkage
                            # (in evidence-count units; higher = more shrinkage toward baseline)
 LEN_PRIOR_STRENGTH <- 20   # beta: same idea, for the CDR3-length enrichment shrinkage
+
+# Decoy V/J background correction (optional). When enabled, the null background in
+# the V/J excess is each gene's pass propensity against a DECOY (non-cognate)
+# epitope — the peptide-INDEPENDENT ESMFold fold artifact — instead of the flat
+# global pass rate. Passing above the decoy level counts as enrichment; germline
+# fold artifacts (e.g. TRAV12-2) stay at baseline, while genuinely epitope-specific
+# V/J (high cognate, low decoy) are still enriched. Recomputed on the fly at each
+# step's own selection threshold, pooled over the decoy step-0 replicates.
+DECOY_CORRECTION <- TRUE                          # master toggle (FALSE = original p_global behaviour)
+DECOY_DIR        <- "step0_background"             # holds rep*/<decoy_label>/step0 folds
+DECOY_BY_MHC     <- c(A0201 = "A0201_ALAAAAAAV")   # MHC (allele w/o HLA_ prefix) -> decoy label
+DECOY_MIN_N      <- 30                             # min decoy samples per gene before trusting its
+                                                   # rate; below this fall back to the global rate
 
 FINAL_PERCENTILE <- 95  # final (STEP="final") top-binder cutoff = this percentile of the POOLED
                         # (alpha+beta) score distribution of the LAST step — i.e. keep the top
@@ -366,7 +379,7 @@ build_cdr3_pssm <- function(cdr3_seqs, pseudocount = 0.1) {
 
 draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
                                     n = 5, len_dist = NULL,
-                                    cdr3_pssm = NULL) {
+                                    cdr3_pssm = NULL, mut_weight = 0) {
   key <- paste0(v_seg, "_", j_seg)
   if (!key %in% names(cdr3_baseline[[chain]])) return(character(0))
 
@@ -399,9 +412,9 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
       else               col / sum(col)
     })
 
-    # Per-position baseline information content, used by the PSSM blend. Scale-free
-    # (computed from the normalized baseline column):
-    #   IC_baseline(pos) = log2(K) - H(pos), K = alphabet size.
+    # Per-position baseline information content, used by BOTH the PSSM blend and
+    # the IC-adjusted mutation. Scale-free (computed from the normalized baseline
+    # column): IC_baseline(pos) = log2(K) - H(pos), K = alphabet size.
     max_ic <- log2(nrow(prob_mat))                     # log2(K); K = 20 for AAs
     ic_pos <- apply(prob_mat, 2, function(col) {
       p <- col[col > 0]
@@ -426,6 +439,41 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
       }
     }
 
+    # (4) IC-adjusted Dirichlet perturbation: randomly re-emphasise amino acids
+    # ALREADY present in the blend by drawing the per-position distribution from
+    # Dirichlet(alpha * P_blend). Support is preserved (an AA with p = 0 gets
+    # shape 0 -> stays 0), so this diversifies WITHIN the observed alphabet only —
+    # no novel residues, no uniform noise. IC-gated on the *baseline* IC like the
+    # PSSM blend (strong at the variable junction, ~0 at conserved anchors) so a
+    # peaked PSSM from few top binders can't over-concentrate the junction.
+    # Selection (ESMFold) decides which variants persist. mut_weight = 0 = off.
+    #   s_pos = mut_weight * (1 - IC/log2K)     per-position perturbation strength
+    #   alpha = (1 - s_pos) / s_pos             Dirichlet concentration:
+    #             s->0  => alpha->Inf => distribution unchanged (anchors)
+    #             s=0.1 => alpha=9    => mild reshuffle around the blend
+    #             s->1  => alpha->0   => single blend-weighted residue (max diversify)
+    if (mut_weight > 0) {
+      s_pos <- mut_weight * (1 - ic_pos / max_ic)
+      s_pos <- pmax(0, pmin(1, s_pos))
+      for (pos in seq_len(ncol(prob_mat))) {
+        s <- s_pos[pos]
+        if (s <= 0) next                                    # anchor: no perturbation
+        p     <- prob_mat[, pos]
+        alpha <- (1 - s) / s                                # total Dirichlet concentration
+        g     <- rgamma(length(p), shape = alpha * p, rate = 1)  # p_i = 0 -> 0 (support kept)
+        if (sum(g) > 0) {
+          prob_mat[, pos] <- g / sum(g)
+        } else {
+          # alpha -> 0 numerical underflow: realise the Dirichlet limit explicitly
+          # (all mass on one residue, drawn proportional to the blend).
+          pick <- sample.int(length(p), 1, prob = p)
+          v <- numeric(length(p)); v[pick] <- 1
+          prob_mat[, pos] <- v
+        }
+      }
+      prob_mat <- apply(prob_mat, 2, function(col) col / sum(col))
+    }
+
     amino_acids <- rownames(prob_mat)
     seq_vec <- sapply(seq_len(ncol(prob_mat)), function(pos) {
       p <- prob_mat[, pos]
@@ -442,7 +490,7 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
 
 sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file,
                                      n = 5, len_dist = NULL,
-                                     cdr3_pssm = NULL) {
+                                     cdr3_pssm = NULL, mut_weight = 0) {
   df           <- read.csv(pair_file)
   chain_letter <- sub("^TR", "", chain)
   v_col        <- paste0("TR", chain_letter, "V")
@@ -453,7 +501,8 @@ sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file
                     MoreArgs = list(cdr3_baseline = cdr3_baseline,
                                    n           = n,
                                    len_dist    = len_dist,
-                                   cdr3_pssm   = cdr3_pssm),
+                                   cdr3_pssm   = cdr3_pssm,
+                                   mut_weight  = mut_weight),
                     SIMPLIFY = FALSE)
 
   df_exp <- data.frame(
@@ -537,38 +586,87 @@ extract_len_baseline_prior <- function(chain_letter) {
 }
 
 
+# Per-V and per-J DECOY pass propensity for one chain, pooled over the decoy
+# step-0 replicates (DECOY_DIR/rep*/<decoy_label>/step0), computed at `threshold`.
+# The decoy is a non-cognate peptide, so this is the peptide-INDEPENDENT ESMFold
+# fold artifact per gene. `mhc` selects the decoy via DECOY_BY_MHC (HLA_ prefix
+# stripped). Returns list(V, J = pass-rate vectors; n_V, n_J = sample counts), or
+# NULL if no decoy is configured/folded for this MHC.
+load_decoy_background <- function(chain_letter, mhc, threshold,
+                                  decoy_dir = DECOY_DIR, decoy_by_mhc = DECOY_BY_MHC,
+                                  score_col = SCORE_COL) {
+  mhc_key <- sub("^HLA_", "", mhc)
+  if (!mhc_key %in% names(decoy_by_mhc)) return(NULL)
+  label      <- decoy_by_mhc[[mhc_key]]
+  chain_name <- if (chain_letter == "A") "alpha" else "beta"
+  v_col      <- paste0("TR", chain_letter, "V")
+  j_col      <- paste0("TR", chain_letter, "J")
+
+  reps <- list.dirs(decoy_dir, recursive = FALSE)
+  reps <- reps[grepl("^rep[0-9]+$", basename(reps))]
+  frames <- list()
+  for (rd in reps) {
+    sf <- file.path(rd, label, "step0", sprintf("output_%s.csv", chain_name))
+    mf <- file.path(rd, label, "step0", sprintf("model_%s.csv",  chain_name))
+    if (file.exists(sf) && file.exists(mf))
+      frames[[length(frames) + 1]] <- load_esm_scores(sf, mf, score_col)[, c(v_col, j_col, score_col)]
+  }
+  if (length(frames) == 0) return(NULL)
+
+  d    <- do.call(rbind, frames)                # pool all replicate decoy TCRs
+  pass <- d[[score_col]] >= threshold
+  rate_n <- function(col) {
+    key <- d[[col]]; keep <- !is.na(key)
+    a <- table(key[keep]); p <- table(key[keep & pass]); g <- names(a)
+    list(rate = setNames(as.numeric(ifelse(g %in% names(p), p[g], 0)) / as.numeric(a[g]), g),
+         n    = setNames(as.integer(a[g]), g))
+  }
+  V <- rate_n(v_col); J <- rate_n(j_col)
+  list(V = V$rate, n_V = V$n, J = J$rate, n_J = J$n)
+}
+
+
 # Factorized, evidence-weighted, baseline-shrunk V/J distribution.
 # The joint (V,J) enrichment is empirically ~fully explained by the product of
 # the marginal V and J effects (interaction ≈ 1), so V and J are modelled
 # INDEPENDENTLY. This credits enrichment to the gene that earned it and stops an
 # enriched V from dragging an unspecific "passenger" J along (and vice versa).
-# Per gene:
-#   excess(g)    = max(0, n_top(g) - n_all(g) * p_global)   [excess over background]
-#   posterior(g) ∝ alpha * P_baseline(g) + excess(g)        [shrink to marginal prior]
+# Per gene the null background is p_global (pooled pass rate) by default, OR — when
+# a decoy background is supplied (decoy_bg from load_decoy_background) — that gene's
+# own decoy pass propensity, so a peptide-independent fold artifact isn't credited
+# as enrichment:
+#   bg(g)        = decoy_bg(g)  if supplied and n_decoy(g) >= min_n, else p_global
+#   excess(g)    = max(0, n_top(g) - n_all(g) * bg(g))       [excess over background]
+#   posterior(g) ∝ alpha * P_baseline(g) + excess(g)         [shrink to marginal prior]
+# decoy_bg = NULL reproduces the original p_global behaviour exactly.
 # Restricted to functional genes (marginal_prior names). Returns list(V, J) or NULL.
-extract_vj_marginal_posterior <- function(top_tcrs, scored, chain_letter, marginal_prior, alpha) {
+extract_vj_marginal_posterior <- function(top_tcrs, scored, chain_letter, marginal_prior, alpha,
+                                           decoy_bg = NULL, min_n = DECOY_MIN_N) {
   v_col <- paste0("TR", chain_letter, "V")
   j_col <- paste0("TR", chain_letter, "J")
   if (!all(c(v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
   if (nrow(scored) == 0) return(NULL)
   p_global <- nrow(top_tcrs) / nrow(scored)
 
-  post <- function(gene_col, prior) {
+  post <- function(gene_col, prior, bg_p, bg_n) {
     n_top <- table(top_tcrs[[gene_col]][!is.na(top_tcrs[[gene_col]])])
     n_all <- table(scored[[gene_col]][!is.na(scored[[gene_col]])])
     genes <- names(prior)
     excess <- vapply(genes, function(g) {
       nt <- if (g %in% names(n_top)) n_top[[g]] else 0
       na <- if (g %in% names(n_all)) n_all[[g]] else 0
-      max(0, nt - na * p_global)
+      # decoy pass propensity as the null; fall back to the pooled global rate when
+      # no decoy is supplied or the gene has too few decoy samples to trust.
+      bg <- if (!is.null(bg_p) && g %in% names(bg_p) && bg_n[[g]] >= min_n) bg_p[[g]] else p_global
+      max(0, nt - na * bg)
     }, numeric(1))
     posterior <- alpha * unlist(prior) + excess
     if (sum(posterior) == 0) return(NULL)
     posterior / sum(posterior)
   }
 
-  pv <- post(v_col, marginal_prior$V)
-  pj <- post(j_col, marginal_prior$J)
+  pv <- post(v_col, marginal_prior$V, decoy_bg$V, decoy_bg$n_V)
+  pj <- post(j_col, marginal_prior$J, decoy_bg$J, decoy_bg$n_J)
   if (is.null(pv) || is.null(pj)) return(NULL)
   list(V = pv, J = pj)
 }
@@ -801,7 +899,7 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
                               n_pairs, n_cdr3_multi, min_tcrs_pssm,
                               vj_baseline_prior, vj_prior_strength,
                               len_baseline_prior, len_prior_strength,
-                              threshold) {
+                              threshold, mut_weight = 0) {
 
   chain_name    <- if (chain_letter == "A") "alpha" else "beta"
   prev_step_dir <- file.path(base_output_dir, label, sprintf("step%d", step - 1))
@@ -832,9 +930,19 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
 
   # (1) V/J distribution: factorized marginal enrichment (V and J independent),
   # each shrunk toward the functional-only marginal prior; pairs formed only from
-  # combinations that have a CDR3 baseline.
+  # combinations that have a CDR3 baseline. When DECOY_CORRECTION is on, the excess
+  # null background is each gene's decoy pass propensity (peptide-independent fold
+  # artifact) at THIS step's threshold, instead of the pooled global rate.
+  decoy_bg <- NULL
+  if (isTRUE(DECOY_CORRECTION)) {
+    decoy_bg <- load_decoy_background(chain_letter, mhc_allele, threshold)
+    if (is.null(decoy_bg))
+      warning(sprintf("[%s] DECOY_CORRECTION on but no decoy background found for MHC %s (chain %s) — using p_global.",
+                      label, mhc_allele, chain_letter))
+  }
   vj_dist <- extract_vj_marginal_posterior(top_tcrs, scored, chain_letter,
-                                           vj_baseline_prior[[chain_letter]], vj_prior_strength)
+                                           vj_baseline_prior[[chain_letter]], vj_prior_strength,
+                                           decoy_bg)
   sample_vj_pairs(vj_dist, chain_letter, n_pairs, step_dir, cdr3_baseline)
 
   # (2) Marginal CDR3 length distribution (excess-over-background shrunk to the
@@ -858,7 +966,7 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   cdr3_file <- file.path(step_dir, sprintf("TR%sV_TR%sJ_cdr3.csv", chain_letter, chain_letter))
   sample_chain_cdr3_multi(chain_tr, pair_file, cdr3_baseline, cdr3_file,
                            n = n_cdr3_multi, len_dist = len_dist,
-                           cdr3_pssm = cdr3_pssm)
+                           cdr3_pssm = cdr3_pssm, mut_weight = mut_weight)
 
   df_chain  <- read.csv(cdr3_file)
   model_out <- file.path(step_dir, sprintf("model_%s.csv", chain_name))
@@ -877,7 +985,7 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
                              n_pairs, n_cdr3_multi, min_tcrs_pssm,
                              vj_baseline_prior, vj_prior_strength,
                              len_baseline_prior, len_prior_strength,
-                             esm_thresholds, species = "HomoSapiens",
+                             esm_thresholds, species = "HomoSapiens", mut_weight = 0,
                              plot_each_step     = PLOT_EACH_STEP,
                              validate_each_step = VALIDATE_EACH_STEP,
                              validation_file    = NULL, mhc = NULL) {
@@ -893,13 +1001,13 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
                                 n_pairs, n_cdr3_multi, min_tcrs_pssm,
                                 vj_baseline_prior, vj_prior_strength,
                                 len_baseline_prior, len_prior_strength,
-                                threshold)
+                                threshold, mut_weight)
   top_beta  <- enrich_one_chain("B", step, label, peptide, mhc_allele, species,
                                 base_output_dir, cdr3_baseline,
                                 n_pairs, n_cdr3_multi, min_tcrs_pssm,
                                 vj_baseline_prior, vj_prior_strength,
                                 len_baseline_prior, len_prior_strength,
-                                threshold)
+                                threshold, mut_weight)
 
   # Optional: MixTCRviz motif plots — saved into prev_step_dir (scores source)
   if (plot_each_step) {
