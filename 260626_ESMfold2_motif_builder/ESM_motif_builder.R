@@ -42,7 +42,7 @@ STEP            <- 1 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_decoy_correction" 
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_decoy_correction_v2" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
@@ -56,17 +56,19 @@ VJ_PRIOR_STRENGTH  <- 60   # alpha: repertoire-prior pseudocount weight for V/J 
                            # (in evidence-count units; higher = more shrinkage toward baseline)
 LEN_PRIOR_STRENGTH <- 20   # beta: same idea, for the CDR3-length enrichment shrinkage
 
-# Decoy V/J background correction (optional). When enabled, the null background in
-# the V/J excess is each gene's pass propensity against a DECOY (non-cognate)
+# Decoy background correction (optional). When enabled, the null background in an
+# excess computation is that level's pass propensity against a DECOY (non-cognate)
 # epitope — the peptide-INDEPENDENT ESMFold fold artifact — instead of the flat
 # global pass rate. Passing above the decoy level counts as enrichment; germline
-# fold artifacts (e.g. TRAV12-2) stay at baseline, while genuinely epitope-specific
-# V/J (high cognate, low decoy) are still enriched. Recomputed on the fly at each
-# step's own selection threshold, pooled over the decoy step-0 replicates.
-DECOY_CORRECTION <- TRUE                          # master toggle (FALSE = original p_global behaviour)
+# fold artifacts (e.g. TRAV12-2, the short-CDR3 preference) stay at baseline, while
+# genuinely epitope-specific levels (high cognate, low decoy) are still enriched.
+# Recomputed on the fly at each step's own selection threshold, pooled over the
+# decoy step-0 replicates. VJ and length corrections toggle independently.
+DECOY_CORRECTION_VJ  <- TRUE                       # correct the V/J excess null background
+DECOY_CORRECTION_LEN <- TRUE                       # correct the CDR3-length excess null background
 DECOY_DIR        <- "step0_background"             # holds rep*/<decoy_label>/step0 folds
 DECOY_BY_MHC     <- c(A0201 = "A0201_ALAAAAAAV")   # MHC (allele w/o HLA_ prefix) -> decoy label
-DECOY_MIN_N      <- 30                             # min decoy samples per gene before trusting its
+DECOY_MIN_N      <- 30                             # min decoy samples per level before trusting its
                                                    # rate; below this fall back to the global rate
 
 FINAL_PERCENTILE <- 95  # final (STEP="final") top-binder cutoff = this percentile of the POOLED
@@ -586,12 +588,13 @@ extract_len_baseline_prior <- function(chain_letter) {
 }
 
 
-# Per-V and per-J DECOY pass propensity for one chain, pooled over the decoy
-# step-0 replicates (DECOY_DIR/rep*/<decoy_label>/step0), computed at `threshold`.
-# The decoy is a non-cognate peptide, so this is the peptide-INDEPENDENT ESMFold
-# fold artifact per gene. `mhc` selects the decoy via DECOY_BY_MHC (HLA_ prefix
-# stripped). Returns list(V, J = pass-rate vectors; n_V, n_J = sample counts), or
-# NULL if no decoy is configured/folded for this MHC.
+# Per-V, per-J and per-CDR3-length DECOY pass propensity for one chain, pooled over
+# the decoy step-0 replicates (DECOY_DIR/rep*/<decoy_label>/step0), computed at
+# `threshold`. The decoy is a non-cognate peptide, so this is the peptide-
+# INDEPENDENT ESMFold fold artifact per level. `mhc` selects the decoy via
+# DECOY_BY_MHC (HLA_ prefix stripped). Returns list(V, J, L = pass-rate vectors;
+# n_V, n_J, n_L = sample counts), or NULL if no decoy is configured/folded for
+# this MHC. Length keys are "L_<n>" (matching extract_cdr3_len_dist).
 load_decoy_background <- function(chain_letter, mhc, threshold,
                                   decoy_dir = DECOY_DIR, decoy_by_mhc = DECOY_BY_MHC,
                                   score_col = SCORE_COL) {
@@ -601,6 +604,7 @@ load_decoy_background <- function(chain_letter, mhc, threshold,
   chain_name <- if (chain_letter == "A") "alpha" else "beta"
   v_col      <- paste0("TR", chain_letter, "V")
   j_col      <- paste0("TR", chain_letter, "J")
+  cdr3_col   <- paste0("cdr3_TR", chain_letter)
 
   reps <- list.dirs(decoy_dir, recursive = FALSE)
   reps <- reps[grepl("^rep[0-9]+$", basename(reps))]
@@ -609,20 +613,21 @@ load_decoy_background <- function(chain_letter, mhc, threshold,
     sf <- file.path(rd, label, "step0", sprintf("output_%s.csv", chain_name))
     mf <- file.path(rd, label, "step0", sprintf("model_%s.csv",  chain_name))
     if (file.exists(sf) && file.exists(mf))
-      frames[[length(frames) + 1]] <- load_esm_scores(sf, mf, score_col)[, c(v_col, j_col, score_col)]
+      frames[[length(frames) + 1]] <- load_esm_scores(sf, mf, score_col)[, c(v_col, j_col, cdr3_col, score_col)]
   }
   if (length(frames) == 0) return(NULL)
 
   d    <- do.call(rbind, frames)                # pool all replicate decoy TCRs
   pass <- d[[score_col]] >= threshold
-  rate_n <- function(col) {
-    key <- d[[col]]; keep <- !is.na(key)
+  rate_n <- function(key) {
+    keep <- !is.na(key)
     a <- table(key[keep]); p <- table(key[keep & pass]); g <- names(a)
     list(rate = setNames(as.numeric(ifelse(g %in% names(p), p[g], 0)) / as.numeric(a[g]), g),
          n    = setNames(as.integer(a[g]), g))
   }
-  V <- rate_n(v_col); J <- rate_n(j_col)
-  list(V = V$rate, n_V = V$n, J = J$rate, n_J = J$n)
+  V <- rate_n(d[[v_col]]); J <- rate_n(d[[j_col]])
+  L <- rate_n(paste0("L_", nchar(d[[cdr3_col]])))
+  list(V = V$rate, n_V = V$n, J = J$rate, n_J = J$n, L = L$rate, n_L = L$n)
 }
 
 
@@ -707,9 +712,15 @@ sample_vj_pairs <- function(vj_dist, chain_letter, n_pairs, output_dir, cdr3_bas
 # shrinkage as the V/J marginals (a raw freq_top/freq_all ratio blows up at rare
 # lengths and, with with-replacement length sampling, hijacks generation toward
 # spurious extreme lengths):
-#   posterior(L) ∝ alpha * P_baseline_len(L) + max(0, n_top(L) - n_all(L) * p_global)
-# alpha = len_prior_strength. Returns a named list over "L_<n>" keys.
-extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter, len_baseline_prior, alpha) {
+#   bg(L)        = decoy_bg(L)  if supplied and n_decoy(L) >= min_n, else p_global
+#   posterior(L) ∝ alpha * P_baseline_len(L) + max(0, n_top(L) - n_all(L) * bg(L))
+# When a decoy background is supplied (decoy_bg$L / n_L from load_decoy_background),
+# each length's own decoy pass propensity is the null — so the peptide-independent
+# short-CDR3 ESMFold preference isn't credited as enrichment. decoy_bg = NULL
+# reproduces the original p_global behaviour. alpha = len_prior_strength. Returns a
+# named list over "L_<n>" keys.
+extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter, len_baseline_prior, alpha,
+                                  decoy_bg = NULL, min_n = DECOY_MIN_N) {
   cdr3_col <- paste0("cdr3_TR", chain_letter)
   if (!cdr3_col %in% colnames(top_tcrs)) return(NULL)
 
@@ -720,12 +731,16 @@ extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter, len_baseline_p
   n_top    <- table(paste0("L_", Lt))
   n_all    <- table(paste0("L_", La))
   p_global <- length(Lt) / length(La)
+  bg_p <- decoy_bg$L; bg_n <- decoy_bg$n_L
 
   lens   <- names(len_baseline_prior)
   excess <- vapply(lens, function(l) {
     nt <- if (l %in% names(n_top)) n_top[[l]] else 0
     na <- if (l %in% names(n_all)) n_all[[l]] else 0
-    max(0, nt - na * p_global)
+    # decoy length pass propensity as the null; fall back to the pooled global rate
+    # when no decoy is supplied or this length has too few decoy samples to trust.
+    bg <- if (!is.null(bg_p) && l %in% names(bg_p) && bg_n[[l]] >= min_n) bg_p[[l]] else p_global
+    max(0, nt - na * bg)
   }, numeric(1))
   posterior <- alpha * unlist(len_baseline_prior) + excess
   if (sum(posterior) == 0) return(NULL)
@@ -928,27 +943,31 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
     return(NULL)
   }
 
-  # (1) V/J distribution: factorized marginal enrichment (V and J independent),
-  # each shrunk toward the functional-only marginal prior; pairs formed only from
-  # combinations that have a CDR3 baseline. When DECOY_CORRECTION is on, the excess
-  # null background is each gene's decoy pass propensity (peptide-independent fold
-  # artifact) at THIS step's threshold, instead of the pooled global rate.
+  # Decoy background (V/J + length pass propensities) at THIS step's threshold,
+  # loaded once if either correction is on; the peptide-independent fold artifact.
   decoy_bg <- NULL
-  if (isTRUE(DECOY_CORRECTION)) {
+  if (isTRUE(DECOY_CORRECTION_VJ) || isTRUE(DECOY_CORRECTION_LEN)) {
     decoy_bg <- load_decoy_background(chain_letter, mhc_allele, threshold)
     if (is.null(decoy_bg))
-      warning(sprintf("[%s] DECOY_CORRECTION on but no decoy background found for MHC %s (chain %s) — using p_global.",
+      warning(sprintf("[%s] Decoy correction on but no decoy background found for MHC %s (chain %s) — using p_global.",
                       label, mhc_allele, chain_letter))
   }
+
+  # (1) V/J distribution: factorized marginal enrichment (V and J independent),
+  # each shrunk toward the functional-only marginal prior; pairs formed only from
+  # combinations that have a CDR3 baseline. When DECOY_CORRECTION_VJ is on, the
+  # excess null background is each gene's decoy pass propensity instead of p_global.
   vj_dist <- extract_vj_marginal_posterior(top_tcrs, scored, chain_letter,
                                            vj_baseline_prior[[chain_letter]], vj_prior_strength,
-                                           decoy_bg)
+                                           if (isTRUE(DECOY_CORRECTION_VJ)) decoy_bg else NULL)
   sample_vj_pairs(vj_dist, chain_letter, n_pairs, step_dir, cdr3_baseline)
 
   # (2) Marginal CDR3 length distribution (excess-over-background shrunk to the
-  # baseline length prior, strength = len_prior_strength)
+  # baseline length prior, strength = len_prior_strength). When DECOY_CORRECTION_LEN
+  # is on, the excess null is each length's decoy pass propensity instead of p_global.
   len_dist <- extract_cdr3_len_dist(top_tcrs, scored, chain_letter,
-                                    len_baseline_prior[[chain_letter]], len_prior_strength)
+                                    len_baseline_prior[[chain_letter]], len_prior_strength,
+                                    if (isTRUE(DECOY_CORRECTION_LEN)) decoy_bg else NULL)
 
   # (3) PSSM from top binders' CDR3s
   cdr3_col <- paste0("cdr3_TR", chain_letter)
