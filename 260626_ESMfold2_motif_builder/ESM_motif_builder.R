@@ -38,7 +38,7 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 3 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
@@ -545,6 +545,17 @@ load_esm_scores <- function(scores_file, model_file, score_col = SCORE_COL) {
 }
 
 
+# Metadata table that matches a folded output_<chain>.csv. Prefer the IMMUTABLE
+# input_<chain>.csv (the exact batch that was sent to ESMFold) when present, so
+# scores are never joined against a model_<chain>.csv that a later run may have
+# regenerated (positional tcrNNNN ids -> silent score/TCR mismatch). Falls back
+# to model_<chain>.csv when no frozen input exists.
+meta_csv <- function(step_dir, chain_name) {
+  inp <- file.path(step_dir, sprintf("input_%s.csv", chain_name))
+  if (file.exists(inp)) inp else file.path(step_dir, sprintf("model_%s.csv", chain_name))
+}
+
+
 # =============================================================================
 # Module 5 — Enrichment helpers (per-chain)
 # =============================================================================
@@ -907,12 +918,12 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   dir.create(step_dir, showWarnings = FALSE, recursive = TRUE)
 
   scores_file <- file.path(prev_step_dir, sprintf("output_%s.csv", chain_name))
-  model_file  <- file.path(prev_step_dir, sprintf("model_%s.csv",  chain_name))
+  model_file  <- meta_csv(prev_step_dir, chain_name)   # prefer frozen input_<chain>.csv
 
   if (!file.exists(scores_file))
     stop(sprintf("[%s] ESM scores file missing: %s\nRun ESMFold (fold.py) on the cluster first.", label, scores_file))
   if (!file.exists(model_file))
-    stop(sprintf("[%s] Model table missing: %s\nThis is the model_%s.csv batch generated for this step.", label, model_file, chain_name))
+    stop(sprintf("[%s] Metadata table missing: %s\nExpected the frozen input_%s.csv (or model_%s.csv) matching the folded output.", label, model_file, chain_name, chain_name))
 
   scored   <- load_esm_scores(scores_file, model_file)
   top_tcrs <- scored[scored[[SCORE_COL]] >= threshold, ]
@@ -1082,7 +1093,7 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
   collect_top <- function(chain_letter) {
     chain_name  <- if (chain_letter == "A") "alpha" else "beta"
     scores_file <- file.path(last_step_dir, sprintf("output_%s.csv", chain_name))
-    model_file  <- file.path(last_step_dir, sprintf("model_%s.csv",  chain_name))
+    model_file  <- meta_csv(last_step_dir, chain_name)   # prefer frozen input_<chain>.csv
     if (!file.exists(scores_file)) {
       warning(sprintf("[%s] ESM scores file missing: %s — skipping chain %s.",
                       label, scores_file, chain_letter))

@@ -16,7 +16,7 @@ REMOTE_BASE=/scratch/rroessne/260626_ESMfold2_motif_builder/TCR_motif_atlas_no_d
 
 # Which step's outputs to fetch. Pass the step number as the first arg
 # (e.g. ./download_outputs.sh 1); defaults to 1.
-step=step2_sample
+step=step2
 
 # cd to the directory the script lives in (the local atlas root)
 cd "$(dirname "$0")"
@@ -36,8 +36,8 @@ for epi in */; do
             echo "   FAILED: $remote_path" >&2
         fi
 
-	remote_path="$REMOTE_BASE/$epi/$step/top_tcrs_${chain}_seqs.csv"
-        local_path="$epi/$step/top_tcrs_${chain}_seqs.csv"
+	remote_path="$REMOTE_BASE/$epi/$step/model_${chain}.csv"
+        local_path="$epi/$step/input_${chain}.csv"
 
         echo ">> $chain: $epi"
         if scp "$REMOTE:$remote_path" "$local_path"; then
@@ -45,6 +45,7 @@ for epi in */; do
         else
             echo "   FAILED: $remote_path" >&2
         fi
+
     done
 done
 
