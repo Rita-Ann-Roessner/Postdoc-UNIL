@@ -42,7 +42,7 @@ STEP            <- 3 #c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_decoy_correction_v2" 
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_no_decoy_correction" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
@@ -63,7 +63,7 @@ LEN_PRIOR_STRENGTH <- 20   # beta: same idea, for the CDR3-length enrichment shr
 # fold artifacts (e.g. TRAV12-2) stay at baseline, while genuinely epitope-specific
 # V/J (high cognate, low decoy) are still enriched. Recomputed on the fly at each
 # step's own selection threshold, pooled over the decoy step-0 replicates.
-DECOY_CORRECTION_VJ  <- TRUE                       # correct the V/J excess null background
+DECOY_CORRECTION_VJ  <- FALSE                       # correct the V/J excess null background
 DECOY_DIR        <- "step0_background"             # holds rep*/<decoy_label>/step0 folds
 DECOY_BY_MHC     <- c(A0201 = "A0201_ALAAAAAAV")   # MHC (allele w/o HLA_ prefix) -> decoy label
 DECOY_MIN_N      <- 30                             # min decoy samples per gene before trusting its
@@ -85,7 +85,7 @@ PLOT_EACH_STEP     <- TRUE   # if TRUE, plot MixTCRviz motif after each enrichme
 VALIDATE_EACH_STEP <- TRUE  # if TRUE, run TEMPO validation after each enrichment step
 
 EPITOPES_FILE <- NULL #"epitopes.txt"   # one "MHC_PEPTIDE" label per line, e.g. "A0201_ELAGIGILTV"
-epitopes <- c("A0201_LLWNGPMAV", "A0201_GILGFVFTL")
+epitopes <- c("A0201_ELAGIGILTV", "A0201_GILGFVFTL", "A0201_LLWNGPMAV")
 
 if (!is.null(EPITOPES_FILE) && file.exists(EPITOPES_FILE)) {
   epitopes <- trimws(readLines(EPITOPES_FILE))
@@ -921,6 +921,9 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
 
   write.csv(top_tcrs, file.path(prev_step_dir, sprintf("top_tcrs_%s.csv", chain_name)),
             row.names = FALSE)
+  # Also write the top binders in fold.py sequence format (ID, TCRA, TCRB, MHC,
+  # B2M, PEPTIDE) so they can be re-folded directly, same as model_<chain>_seqs.csv.
+  write_fold_input_csv(top_tcrs, file.path(prev_step_dir, sprintf("top_tcrs_%s_seqs.csv", chain_name)))
 
   if (nrow(top_tcrs) < 10) {
     warning(sprintf("[%s] Too few top binders for chain %s (n=%d) — skipping enrichment.",
@@ -1090,6 +1093,8 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
     message(sprintf("  [chain %s] %d / %d top binders", chain_letter, nrow(top_tcrs), nrow(scored)))
     write.csv(top_tcrs, file.path(last_step_dir, sprintf("top_tcrs_%s.csv", chain_name)),
               row.names = FALSE)
+    # Also write fold.py sequence format for potential re-folding.
+    write_fold_input_csv(top_tcrs, file.path(last_step_dir, sprintf("top_tcrs_%s_seqs.csv", chain_name)))
     top_tcrs
   }
 
