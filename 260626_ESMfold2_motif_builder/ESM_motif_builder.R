@@ -38,16 +38,16 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- c(1, 2, 3)        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 3        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_no_decoy_correction" 
+BASE_OUTPUT_DIR <- "IMMREP25" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
 #ESM_THRESHOLDS  <- c(0.5, 0.6, 0.7) #c(0.5, 0.6, 0.7, 0.7)
-ESM_THRESHOLDS  <- c(0.5, 0.6, 0.65)
+ESM_THRESHOLDS  <- c(0.5, 0.6, 0.6)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
@@ -84,8 +84,13 @@ CHAIN_WEIGHT <- "linear" # how TEMPO combines the two chains when scoring valida
 PLOT_EACH_STEP     <- TRUE   # if TRUE, plot MixTCRviz motif after each enrichment step
 VALIDATE_EACH_STEP <- TRUE  # if TRUE, run TEMPO validation after each enrichment step
 
+VALIDATION_AVAILABLE <- TRUE  # set FALSE when this epitope has NO validation data — skips ALL
+                              # TEMPO validation (per-step AND final); motifs are still built and
+                              # written. Manual flag on purpose (not auto file-detection), so a
+                              # misplaced validation.csv can't silently pass unnoticed.
+
 EPITOPES_FILE <- NULL #"epitopes.txt"   # one "MHC_PEPTIDE" label per line, e.g. "A0201_ELAGIGILTV"
-epitopes <- c("A0201_ELAGIGILTV", "A0201_GILGFVFTL", "A0201_LLWNGPMAV")
+epitopes <- c("A0201_KLYPFLWFA", "A0201_SQFNWTIYL", "A0201_TVYPYGTSL")
 
 if (!is.null(EPITOPES_FILE) && file.exists(EPITOPES_FILE)) {
   epitopes <- trimws(readLines(EPITOPES_FILE))
@@ -1043,7 +1048,8 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
   }
 
   # Optional: TEMPO validation — saved into prev_step_dir (scores source)
-  if (validate_each_step && !is.null(motif_file) && !is.null(validation_file) && !is.null(mhc)) {
+  if (isTRUE(VALIDATION_AVAILABLE) && validate_each_step &&
+      !is.null(motif_file) && !is.null(validation_file) && !is.null(mhc)) {
     validate_motif(
       motif_file      = motif_file,
       validation_file = validation_file,
@@ -1123,6 +1129,11 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
   write.csv(motif_df, motif_file, row.names = FALSE)
   message(sprintf("[%s] Motif training set: %d TCRs written to %s",
                   label, nrow(motif_df), motif_file))
+
+  if (!isTRUE(VALIDATION_AVAILABLE)) {
+    message(sprintf("[%s] VALIDATION_AVAILABLE = FALSE — motif written; skipping TEMPO validation.", label))
+    return(NULL)
+  }
 
   val_dir    <- file.path(base_output_dir, label, "validation")
   auc_result <- validate_motif(
