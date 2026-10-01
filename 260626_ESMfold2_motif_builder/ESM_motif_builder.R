@@ -38,16 +38,16 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 3        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 0        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "IMMREP25" 
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
 #ESM_THRESHOLDS  <- c(0.5, 0.6, 0.7) #c(0.5, 0.6, 0.7, 0.7)
-ESM_THRESHOLDS  <- c(0.5, 0.6, 0.6)
+ESM_THRESHOLDS  <- c(0.5, 0.6, 0.7)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
@@ -55,6 +55,28 @@ MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
 VJ_PRIOR_STRENGTH  <- 60   # alpha: repertoire-prior pseudocount weight for V/J shrinkage
                            # (in evidence-count units; higher = more shrinkage toward baseline)
 LEN_PRIOR_STRENGTH <- 20   # beta: same idea, for the CDR3-length enrichment shrinkage
+
+# --- Germline-templated CDR3 generation (Module 3b) --------------------------
+# TRUE  = build each CDR3 as  V-germline block + junction + J-germline block,
+#         with the trimming extents sampled from the V/J/L baseline PWM itself.
+#         Germline blocks are emitted ATOMICALLY, so e.g. TRAJ30's "DDKIIF"
+#         can never be mangled into "DGKIIF" by independent per-position draws.
+# FALSE = legacy behaviour (every position drawn independently).
+CDR3_TEMPLATED  <- TRUE
+JUNCTION_PSSM   <- FALSE   # TRUE = let the top-binder PSSM shape the junction residues.
+                           # FALSE = junction drawn from the V/J baseline only, so no
+                           # top-binder information enters the CDR3 sequence at all
+                           # (enrichment then acts solely via V/J and length choice).
+TEMPLATE_MAX_TRIES <- 20   # redraws allowed when v_ext + j_ext would exceed L
+
+# --- Fixed step-0 panel ------------------------------------------------------
+# Path to a one-off generated step-0 repertoire reused for EVERY epitope, so that
+# tcrNNNN is literally the same TCR everywhere and step-0 scores are directly
+# paired across peptides (differences are peptide effects, not sampling noise).
+# Only peptide / MHC / species are re-stamped per epitope; the TCRs are identical.
+# Create it once with:  Rscript generate_step0_panel.R
+# NULL = draw a fresh step-0 repertoire per epitope (the original behaviour).
+STEP0_PANEL <- "step0_panel"
 
 # Decoy V/J background correction (optional). When enabled, the null background in
 # the V/J excess is each gene's pass propensity against a DECOY (non-cognate)
@@ -90,7 +112,7 @@ VALIDATION_AVAILABLE <- TRUE  # set FALSE when this epitope has NO validation da
                               # misplaced validation.csv can't silently pass unnoticed.
 
 EPITOPES_FILE <- NULL #"epitopes.txt"   # one "MHC_PEPTIDE" label per line, e.g. "A0201_ELAGIGILTV"
-epitopes <- c("A0201_KLYPFLWFA", "A0201_SQFNWTIYL", "A0201_TVYPYGTSL")
+epitopes <- c("A0201_ELAGIGILTV", "A0201_GILGFVFTL", "A0201_LLWNGPMAV")
 
 if (!is.null(EPITOPES_FILE) && file.exists(EPITOPES_FILE)) {
   epitopes <- trimws(readLines(EPITOPES_FILE))
@@ -279,6 +301,15 @@ draw_random_cdr3 <- function(chain, v_seg, j_seg, cdr3_baseline) {
   prob_mat <- apply(as.matrix(vj_counts[[len]]), 2, function(col) {
     if (sum(col) == 0) rep(0, length(col)) else col / sum(col)
   })
+
+  # germline-templated assembly (same path the enrichment steps use), so step 0
+  # and steps 1+ produce CDR3s of the same construction. Falls through to plain
+  # per-position sampling when no template is available.
+  if (isTRUE(CDR3_TEMPLATED)) {
+    s <- assemble_templated_cdr3(chain, v_seg, j_seg, prob_mat)
+    if (!is.na(s)) return(s)
+  }
+
   seq_vec <- sapply(seq_len(ncol(prob_mat)), function(pos) {
     p <- prob_mat[, pos]
     if (sum(p) == 0) return(NA_character_)
@@ -379,6 +410,130 @@ build_cdr3_pssm <- function(cdr3_seqs, pseudocount = 0.1) {
 
 
 # =============================================================================
+# Module 3a — Germline CDR3 templates and trimming extents
+#
+# A rearranged CDR3 is  V-germline(trimmed) + N-additions(+D) + J-germline(trimmed).
+# The germline halves are deterministic given the gene; what varies is HOW MUCH of
+# each survives exonuclease trimming. That trimming profile is already recoverable
+# from the baseline PWM: at a position still covered by the V template, the PWM
+# shows the germline residue with high probability, and that probability decays as
+# you walk inward. So
+#       P(V extent >= i)  ~=  PWM[ v_germline[i], i ]
+# is a survival curve, and differencing it gives the extent distribution. Same from
+# the other end for J. No external recombination model (OLGA/IGoR) needed.
+# =============================================================================
+
+# gene -> its germline CDR3 contribution ("CAVN" for TRAV12-2, "NRDDKIIF" for TRAJ30)
+load_germline_cdr3 <- function(input_dir = INPUT_DIR) {
+  strip_gaps <- function(x) gsub("-", "", gsub("g", "", x))
+  setNames(lapply(c("TRAV", "TRAJ", "TRBV", "TRBJ"), function(seg) {
+    df <- read.csv(file.path(input_dir, paste0(seg, ".csv")), stringsAsFactors = FALSE)
+    names(df)[1] <- "gene"
+    v <- strip_gaps(df$CDR3)
+    setNames(v, df$gene)[nzchar(v) & !is.na(v)]
+  }), c("TRAV", "TRAJ", "TRBV", "TRBJ"))
+}
+
+# Template lookup with composite-name fallback: "TRBV6-2/6-3" is a merge of two
+# genes that are identical over CDR1/2/3, and only the composite name is absent
+# from the reference table, so resolving to the part before "/" loses nothing.
+germline_cdr3_part <- function(seg, gene, germline = GERMLINE_CDR3) {
+  tab <- germline[[seg]]
+  if (is.null(tab) || is.null(gene) || is.na(gene)) return(NA_character_)
+  if (gene %in% names(tab)) return(unname(tab[[gene]]))
+  if (grepl("/", gene, fixed = TRUE)) {
+    base <- sub("/.*$", "", gene)
+    if (base %in% names(tab)) return(unname(tab[[base]]))
+  }
+  NA_character_
+}
+
+# P(extent = i) for i = 1..length(surv), from a survival curve P(extent >= i).
+# cummin enforces the nesting constraint (if position 3 is templated, 1 and 2 are
+# too) and incidentally denoises the PWM estimate. Extent 0 is excluded on
+# purpose: the conserved C (V-encoded) and F/W (J-encoded) are the definitional
+# boundaries of a CDR3 and are never trimmed away, so every CDR3 keeps at least
+# one germline residue at each end.
+.extent_probs <- function(surv) {
+  surv <- cummin(pmax(0, pmin(1, surv)))
+  p <- surv - c(surv[-1], 0)
+  if (sum(p) <= 0) return(NULL)
+  p / sum(p)
+}
+
+# Sample how far the V and J germline templates survive, given the baseline PWM
+# for this V/J pair at this length. Returns NULL if no valid (non-overlapping)
+# pair of extents can be drawn.
+sample_extents <- function(prob_mat, v_tmpl, j_tmpl, L,
+                           max_tries = TEMPLATE_MAX_TRIES) {
+  aas <- rownames(prob_mat)
+  surv_at <- function(res, pos) if (res %in% aas && pos >= 1 && pos <= L) prob_mat[res, pos] else 0
+
+  # Cap each extent at L-1 so neither template can consume the whole sequence:
+  # guarantees (v_ext = 1, j_ext = 1) is always available and the retry loop below
+  # terminates. L >= 2 is required for both anchors to exist at all.
+  if (L < 2) return(NULL)
+  vc <- strsplit(v_tmpl, "")[[1]]; jc <- strsplit(j_tmpl, "")[[1]]
+  nv <- min(length(vc), L - 1);    nj <- min(length(jc), L - 1)
+  if (nv < 1 || nj < 1) return(NULL)
+
+  surv_v <- vapply(seq_len(nv), function(i) surv_at(vc[i], i), numeric(1))
+  # J is aligned to the C-terminus: its last residue sits at position L
+  surv_j <- vapply(seq_len(nj), function(k)
+                     surv_at(jc[length(jc) - k + 1], L - k + 1), numeric(1))
+
+  pv <- .extent_probs(surv_v); pj <- .extent_probs(surv_j)
+  if (is.null(pv) || is.null(pj)) return(NULL)
+
+  for (i in seq_len(max_tries)) {
+    v_ext <- sample(seq_len(nv), 1, prob = pv)
+    j_ext <- sample(seq_len(nj), 1, prob = pj)
+    if (v_ext + j_ext <= L) return(list(v_ext = v_ext, j_ext = j_ext))
+  }
+  # persistent overlap (short L, long templates): keep V, clamp J to what fits,
+  # never below 1 so the C-terminal F/W anchor stays germline
+  v_ext <- min(sample(seq_len(nv), 1, prob = pv), L - 1)
+  list(v_ext = v_ext, j_ext = max(1, min(nj, L - v_ext)))
+}
+
+# Assemble ONE CDR3 as  V-germline block + junction + J-germline block, given the
+# baseline PWM for this V/J pair at this length. The germline blocks are copied
+# verbatim (so they are emitted atomically); only the junction is sampled per
+# position. Used by BOTH step 0 (draw_random_cdr3) and the enrichment steps
+# (draw_random_cdr3_multi) so the two stay consistent.
+#   base_prob  baseline PWM -> trimming survival curves
+#   junc_src   PWM the junction residues are drawn from (= base_prob unless the
+#              caller wants a PSSM-blended junction)
+# Returns NA_character_ when no template exists or the extents are degenerate;
+# the caller then falls back to plain per-position sampling.
+assemble_templated_cdr3 <- function(chain, v_seg, j_seg, base_prob, junc_src = base_prob) {
+  cl     <- sub("^TR", "", chain)
+  v_tmpl <- germline_cdr3_part(paste0("TR", cl, "V"), v_seg)
+  j_tmpl <- germline_cdr3_part(paste0("TR", cl, "J"), j_seg)
+  if (is.na(v_tmpl) || is.na(j_tmpl)) return(NA_character_)
+
+  L   <- ncol(base_prob)
+  ext <- sample_extents(base_prob, v_tmpl, j_tmpl, L)
+  if (is.null(ext)) return(NA_character_)
+  n_junc <- L - ext$v_ext - ext$j_ext
+  if (n_junc < 0) return(NA_character_)
+
+  junc <- character(0)
+  if (n_junc > 0) {
+    aas  <- rownames(junc_src)
+    junc <- vapply(seq_len(n_junc), function(k) {
+      p <- junc_src[, ext$v_ext + k]
+      if (sum(p) == 0) NA_character_ else sample(aas, 1, prob = p)
+    }, character(1))
+    if (any(is.na(junc))) return(NA_character_)
+  }
+  paste0(substr(v_tmpl, 1, ext$v_ext),
+         paste0(junc, collapse = ""),
+         substring(j_tmpl, nchar(j_tmpl) - ext$j_ext + 1))
+}
+
+
+# =============================================================================
 # Module 3 — Multi-CDR3 sampling with V/J + length + PSSM enrichments
 # =============================================================================
 
@@ -416,6 +571,10 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
       if (sum(col) == 0) rep(1 / nrow(count_mat), nrow(count_mat))
       else               col / sum(col)
     })
+    # untouched baseline copy: the trimming survival curves must be read off the
+    # BASELINE, not off a PSSM-blended matrix (and it is also what the junction is
+    # drawn from when JUNCTION_PSSM = FALSE).
+    base_prob <- prob_mat
 
     # Per-position baseline information content, used by BOTH the PSSM blend and
     # the IC-adjusted mutation. Scale-free (computed from the normalized baseline
@@ -480,7 +639,20 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
     }
 
     amino_acids <- rownames(prob_mat)
-    seq_vec <- sapply(seq_len(ncol(prob_mat)), function(pos) {
+    L <- ncol(prob_mat)
+
+    # ---- (5) germline-templated assembly ------------------------------------
+    # V block + junction + J block, via the same helper step 0 uses. Extents are
+    # always read off the untouched baseline; only the junction may be drawn from
+    # the PSSM-blended matrix, and only when JUNCTION_PSSM = TRUE.
+    if (isTRUE(CDR3_TEMPLATED)) {
+      s <- assemble_templated_cdr3(chain, v_seg, j_seg, base_prob,
+                                   junc_src = if (isTRUE(JUNCTION_PSSM)) prob_mat else base_prob)
+      if (!is.na(s)) return(s)
+      # no template / degenerate extents -> fall through to per-position sampling
+    }
+
+    seq_vec <- sapply(seq_len(L), function(pos) {
       p <- prob_mat[, pos]
       if (sum(p) == 0) return(NA_character_)
       sample(amino_acids, 1, prob = p)
@@ -872,9 +1044,35 @@ build_motif_df <- function(top_alpha, top_beta, model_label) {
 # =============================================================================
 
 run_step0 <- function(peptide, mhc_allele, label, cdr3_baseline,
-                       base_output_dir, input_dir, species = "HomoSapiens") {
+                       base_output_dir, input_dir, species = "HomoSapiens",
+                       panel_dir = STEP0_PANEL) {
   step_dir <- file.path(base_output_dir, label, "step0")
   dir.create(step_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # ---- fixed panel: reuse one repertoire for every epitope -------------------
+  # The TCRs (and their tcrNNNN ids) are identical across epitopes; only the
+  # peptide / MHC / species columns are re-stamped. Nothing is re-drawn.
+  if (!is.null(panel_dir) && nzchar(panel_dir)) {
+    message(sprintf("[%s] Step 0: using fixed panel '%s'", label, panel_dir))
+    for (cn in c("alpha", "beta")) {
+      src <- file.path(panel_dir, sprintf("model_%s.csv", cn))
+      if (!file.exists(src))
+        stop(sprintf("STEP0_PANEL is set but '%s' is missing.\nCreate the panel once with: Rscript generate_step0_panel.R", src))
+      df <- read.csv(src, stringsAsFactors = FALSE)
+      df$peptide <- peptide; df$MHC <- mhc_allele; df$species <- species
+      out <- file.path(step_dir, sprintf("model_%s.csv", cn))
+      write.csv(df, out, row.names = FALSE)
+      write_fold_input_csv(df, sub("\\.csv$", "_seqs.csv", out))
+    }
+    n_alpha <- nrow(read.csv(file.path(step_dir, "model_alpha.csv")))
+    n_beta  <- nrow(read.csv(file.path(step_dir, "model_beta.csv")))
+    message(sprintf("[%s] Step 0 done: %d alpha-batch TCRs, %d beta-batch TCRs (from panel).",
+                    label, n_alpha, n_beta))
+    message(sprintf("[%s] → Run ESMFold on cluster, then place results as:\n  %s\n  %s",
+                    label, file.path(step_dir, "output_alpha.csv"),
+                    file.path(step_dir, "output_beta.csv")))
+    return(invisible(step_dir))
+  }
 
   message(sprintf("[%s] Step 0: generating flat-random TCR batches with dummy partner chains", label))
 
@@ -1155,6 +1353,7 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
 baseline         <- MixTCRviz::baseline_HomoSapiens
 cdr3_baseline    <- baseline$countCDR3.VJL
 functional_genes <- load_functional_genes(INPUT_DIR)   # gene_type == "F" only
+GERMLINE_CDR3    <- load_germline_cdr3(INPUT_DIR)      # gene -> germline CDR3 block
 vj_baseline_prior  <- list(A = extract_vj_marginal_prior("A", functional_genes),
                            B = extract_vj_marginal_prior("B", functional_genes))
 len_baseline_prior <- list(A = extract_len_baseline_prior("A"),
