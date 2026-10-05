@@ -51,12 +51,14 @@ level_counts <- function(step0_dir, chain_letter, threshold = THRESHOLD) {
   )
 }
 
-# pool a level-count table across replicate dirs for one label + chain
+# pool a level-count table for one label + chain. background_step0_dirs() handles
+# both the current single-panel layout (<dir>/<label>/step0) and the legacy
+# replicate layout (<dir>/rep<N>/<label>/step0); with one fold there is nothing to
+# pool and rate_min/rate_max simply collapse onto bg_rate.
 pool_background <- function(label, chain_letter) {
-  reps <- list.dirs(OUT_DIR, recursive = FALSE)
-  reps <- reps[grepl("rep[0-9]+$", basename(reps))]
+  dirs <- background_step0_dirs(OUT_DIR, label)
   per_rep <- Filter(Negate(is.null),
-                    lapply(reps, function(rd) level_counts(file.path(rd, label, "step0"), chain_letter)))
+                    lapply(dirs, function(sd) level_counts(sd, chain_letter)))
   if (length(per_rep) == 0) return(NULL)
 
   all <- do.call(rbind, Map(function(df, i) { df$rep <- i; df }, per_rep, seq_along(per_rep)))

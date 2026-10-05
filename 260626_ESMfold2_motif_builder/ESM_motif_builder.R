@@ -4,6 +4,21 @@ library(dplyr)
 library(tidyr)
 library(pROC)
 
+# TEMPOtrain and MixTCRviz must come from the same library: an older TEMPOtrain
+# built against the pre-2026-09 MixTCRviz calls clean_input(merge.ambiguous=),
+# which the current MixTCRviz no longer accepts. A stale copy in another library
+# entry is the usual cause, so fail loudly rather than part-way through a run.
+local({
+  libs <- vapply(c("TEMPOtrain", "MixTCRviz"),
+                 function(p) dirname(getNamespaceInfo(p, "path")), character(1))
+  if (length(unique(libs)) > 1)
+    warning("TEMPOtrain and MixTCRviz are loaded from different libraries:\n  ",
+            paste(sprintf("%s: %s", names(libs), libs), collapse = "\n  "),
+            "\nIf TEMPO steps fail with 'unused argument (merge.ambiguous = F)', ",
+            "a stale TEMPOtrain is shadowing the current one.",
+            call. = FALSE, immediate. = TRUE)
+})
+
 # =============================================================================
 # ESM Motif Builder
 #
@@ -38,7 +53,7 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 0        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 1        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
@@ -55,6 +70,10 @@ MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
 VJ_PRIOR_STRENGTH  <- 60   # alpha: repertoire-prior pseudocount weight for V/J shrinkage
                            # (in evidence-count units; higher = more shrinkage toward baseline)
 LEN_PRIOR_STRENGTH <- 20   # beta: same idea, for the CDR3-length enrichment shrinkage
+LEN_ENRICH_MAX_FOLD <- 10  # cap on the global length enrichment factor applied to a V/J
+                           # pair's own baseline length distribution (see
+                           # draw_random_cdr3_multi). Keeps a rare length whose global
+                           # posterior/baseline ratio is extreme from hijacking generation.
 
 # --- Germline-templated CDR3 generation (Module 3b) --------------------------
 # TRUE  = build each CDR3 as  V-germline block + junction + J-germline block,
@@ -382,29 +401,34 @@ pair_with_dummy_alpha <- function(df_B, peptide, mhc_allele, species, output_fil
 # Module 2 — PSSM from high-scoring CDR3 sequences
 # =============================================================================
 
-build_cdr3_pssm <- function(cdr3_seqs, pseudocount = 0.1) {
-  cdr3_seqs <- cdr3_seqs[!is.na(cdr3_seqs) & nchar(cdr3_seqs) > 0]
+# `weights` (one per sequence, default 1) lets the decoy correction reach the PSSM:
+# a CDR3 from a gene that passes at its decoy rate contributes little or nothing.
+# All-1 weights reproduce the uncorrected counts exactly.
+build_cdr3_pssm <- function(cdr3_seqs, weights = NULL, pseudocount = 0.1) {
+  if (is.null(weights)) weights <- rep(1, length(cdr3_seqs))
+  keep      <- !is.na(cdr3_seqs) & nchar(cdr3_seqs) > 0
+  cdr3_seqs <- cdr3_seqs[keep]; weights <- weights[keep]
   if (length(cdr3_seqs) == 0) return(NULL)
 
   amino_acids <- c("A","C","D","E","F","G","H","I","K","L",
                    "M","N","P","Q","R","S","T","V","W","Y")
-  by_length <- split(cdr3_seqs, nchar(cdr3_seqs))
+  idx_by_length <- split(seq_along(cdr3_seqs), nchar(cdr3_seqs))
 
-  pssm_list <- lapply(names(by_length), function(len_str) {
-    seqs <- by_length[[len_str]]
-    L    <- as.integer(len_str)
-    mat  <- matrix(pseudocount, nrow = length(amino_acids), ncol = L,
-                   dimnames = list(amino_acids, NULL))
-    for (seq in seqs) {
-      chars <- strsplit(seq, "")[[1]]
+  pssm_list <- lapply(names(idx_by_length), function(len_str) {
+    idx <- idx_by_length[[len_str]]
+    L   <- as.integer(len_str)
+    mat <- matrix(pseudocount, nrow = length(amino_acids), ncol = L,
+                  dimnames = list(amino_acids, NULL))
+    for (i in idx) {
+      chars <- strsplit(cdr3_seqs[i], "")[[1]]
       for (pos in seq_along(chars)) {
         aa <- chars[pos]
-        if (aa %in% amino_acids) mat[aa, pos] <- mat[aa, pos] + 1
+        if (aa %in% amino_acids) mat[aa, pos] <- mat[aa, pos] + weights[i]
       }
     }
     apply(mat, 2, function(col) col / sum(col))
   })
-  names(pssm_list) <- paste0("L_", names(by_length))
+  names(pssm_list) <- paste0("L_", names(idx_by_length))
   pssm_list
 }
 
@@ -538,7 +562,7 @@ assemble_templated_cdr3 <- function(chain, v_seg, j_seg, base_prob, junc_src = b
 # =============================================================================
 
 draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
-                                    n = 5, len_dist = NULL,
+                                    n = 5, len_dist = NULL, len_baseline = NULL,
                                     cdr3_pssm = NULL, mut_weight = 0) {
   key <- paste0(v_seg, "_", j_seg)
   if (!key %in% names(cdr3_baseline[[chain]])) return(character(0))
@@ -546,22 +570,43 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
   vj_counts         <- cdr3_baseline[[chain]][[key]]
   lengths_available <- names(vj_counts)
 
-  # Sample up to n DISTINCT lengths (each at most once) from the marginal enriched
-  # length distribution (excess-over-background shrunk to the baseline length
-  # prior). Weights decide *which* lengths are drawn — enrichment favours
-  # rare-but-real lengths — without over-concentrating multiple CDR3s on one length.
-  active_len_dist <- len_dist
-  valid_lens <- if (!is.null(active_len_dist)) intersect(names(active_len_dist), lengths_available) else character(0)
-  probs      <- if (length(valid_lens) > 0) unlist(active_len_dist[valid_lens]) else numeric(0)
+  # ---- length weights: THIS pair's own baseline, modulated by global enrichment
+  # CDR3 length is largely determined by the J gene (per-J mean CDR3a length spans
+  # 10.1-14.0 while within-J sd is 0.4-1.6), so a length posterior pooled over all
+  # V/J pairs is badly mis-conditioned for any single pair. Instead use the pair's
+  # own baseline (exactly what step 0 does) and reweight it by how much the global
+  # enrichment favours each length over the global baseline:
+  #     P(L | V,J)  ∝  count_pair(L)  *  len_dist(L) / len_baseline(L)
+  # With no enrichment (len_dist == len_baseline) the factor is 1 and this reduces
+  # to step 0's behaviour. Lengths absent from either global table get factor 1
+  # (neutral) rather than being dropped.
+  pair_cnt <- vapply(lengths_available,
+                     function(l) sum(vj_counts[[l]][, 1], na.rm = TRUE), numeric(1))
+  names(pair_cnt) <- lengths_available
+  valid_lens <- lengths_available[pair_cnt > 0]
+
+  if (length(valid_lens) > 0) {
+    w <- rep(1, length(valid_lens)); names(w) <- valid_lens
+    if (!is.null(len_dist) && !is.null(len_baseline)) {
+      for (l in valid_lens) {
+        d <- if (l %in% names(len_dist))     as.numeric(len_dist[[l]])     else NA_real_
+        b <- if (l %in% names(len_baseline)) as.numeric(len_baseline[[l]]) else NA_real_
+        if (!is.na(d) && !is.na(b) && b > 0)
+          # cap the fold-change: a rare length can otherwise hijack generation
+          w[[l]] <- min(max(d / b, 1 / LEN_ENRICH_MAX_FOLD), LEN_ENRICH_MAX_FOLD)
+      }
+    }
+    probs <- pair_cnt[valid_lens] * w
+  } else {
+    probs <- numeric(0)
+  }
 
   if (length(valid_lens) > 0 && sum(probs) > 0) {
     probs         <- probs / sum(probs)
     selected_lens <- sample(valid_lens, size = min(n, sum(probs > 0)),
                             replace = FALSE, prob = probs)
   } else {
-    # No enriched length overlaps this V/J pair's available lengths — e.g.
-    # len_prior_strength = 0 can zero out every length this pair supports.
-    # Fall back to a uniform draw over the pair's available lengths.
+    # pair has no usable length counts at all -> uniform over whatever it supports
     selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
   }
 
@@ -666,7 +711,7 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
 
 
 sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file,
-                                     n = 5, len_dist = NULL,
+                                     n = 5, len_dist = NULL, len_baseline = NULL,
                                      cdr3_pssm = NULL, mut_weight = 0) {
   df           <- read.csv(pair_file)
   chain_letter <- sub("^TR", "", chain)
@@ -676,10 +721,11 @@ sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file
   results <- mapply(draw_random_cdr3_multi,
                     chain = chain, v_seg = df[[v_col]], j_seg = df[[j_col]],
                     MoreArgs = list(cdr3_baseline = cdr3_baseline,
-                                   n           = n,
-                                   len_dist    = len_dist,
-                                   cdr3_pssm   = cdr3_pssm,
-                                   mut_weight  = mut_weight),
+                                   n            = n,
+                                   len_dist     = len_dist,
+                                   len_baseline = len_baseline,
+                                   cdr3_pssm    = cdr3_pssm,
+                                   mut_weight   = mut_weight),
                     SIMPLIFY = FALSE)
 
   df_exp <- data.frame(
@@ -780,6 +826,19 @@ extract_len_baseline_prior <- function(chain_letter) {
 # artifact per gene. `mhc` selects the decoy via DECOY_BY_MHC (HLA_ prefix
 # stripped). Returns list(V, J = pass-rate vectors; n_V, n_J = sample counts), or
 # NULL if no decoy is configured/folded for this MHC.
+# Step-0 fold directories holding one background label. Supports both layouts:
+#   <dir>/<label>/step0          single fold of the fixed step-0 panel (current)
+#   <dir>/rep<N>/<label>/step0   independent CDR3 replicates (legacy)
+# Returns every directory that exists, so a mixed tree still works -- though old
+# replicate folds predate germline templating and should not be pooled with new ones.
+background_step0_dirs <- function(dir, label) {
+  flat <- file.path(dir, label, "step0")
+  reps <- list.dirs(dir, recursive = FALSE)
+  reps <- reps[grepl("^rep[0-9]+$", basename(reps))]
+  cand <- c(flat, file.path(reps, label, "step0"))
+  cand[dir.exists(cand)]
+}
+
 load_decoy_background <- function(chain_letter, mhc, threshold,
                                   decoy_dir = DECOY_DIR, decoy_by_mhc = DECOY_BY_MHC,
                                   score_col = SCORE_COL) {
@@ -790,12 +849,10 @@ load_decoy_background <- function(chain_letter, mhc, threshold,
   v_col      <- paste0("TR", chain_letter, "V")
   j_col      <- paste0("TR", chain_letter, "J")
 
-  reps <- list.dirs(decoy_dir, recursive = FALSE)
-  reps <- reps[grepl("^rep[0-9]+$", basename(reps))]
   frames <- list()
-  for (rd in reps) {
-    sf <- file.path(rd, label, "step0", sprintf("output_%s.csv", chain_name))
-    mf <- file.path(rd, label, "step0", sprintf("model_%s.csv",  chain_name))
+  for (sd in background_step0_dirs(decoy_dir, label)) {
+    sf <- file.path(sd, sprintf("output_%s.csv", chain_name))
+    mf <- file.path(sd, sprintf("model_%s.csv",  chain_name))
     if (file.exists(sf) && file.exists(mf))
       frames[[length(frames) + 1]] <- load_esm_scores(sf, mf, score_col)[, c(v_col, j_col, score_col)]
   }
@@ -897,17 +954,24 @@ sample_vj_pairs <- function(vj_dist, chain_letter, n_pairs, output_dir, cdr3_bas
 # spurious extreme lengths):
 #   posterior(L) ∝ alpha * P_baseline_len(L) + max(0, n_top(L) - n_all(L) * p_global)
 # alpha = len_prior_strength. Returns a named list over "L_<n>" keys.
-extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter, len_baseline_prior, alpha) {
+# `weights` (one per top-binder row, default 1) carries the decoy correction into
+# the length posterior: passers from decoy-prone genes count for less. The global
+# pass rate is weighted the same way so excess stays on a consistent scale.
+# All-1 weights reproduce the uncorrected counts exactly.
+extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter, len_baseline_prior, alpha,
+                                  weights = NULL) {
   cdr3_col <- paste0("cdr3_TR", chain_letter)
   if (!cdr3_col %in% colnames(top_tcrs)) return(NULL)
+  if (is.null(weights)) weights <- rep(1, nrow(top_tcrs))
 
-  Lt <- nchar(top_tcrs[[cdr3_col]][!is.na(top_tcrs[[cdr3_col]])])
+  keep_t <- !is.na(top_tcrs[[cdr3_col]])
+  Lt <- nchar(top_tcrs[[cdr3_col]][keep_t]); wt <- weights[keep_t]
   La <- nchar(scored[[cdr3_col]][!is.na(scored[[cdr3_col]])])
   if (length(Lt) == 0 || length(La) == 0) return(NULL)
 
-  n_top    <- table(paste0("L_", Lt))
+  n_top    <- tapply(wt, paste0("L_", Lt), sum)
   n_all    <- table(paste0("L_", La))
-  p_global <- length(Lt) / length(La)
+  p_global <- sum(wt) / length(La)
 
   lens   <- names(len_baseline_prior)
   excess <- vapply(lens, function(l) {
@@ -1164,15 +1228,47 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
                                            decoy_bg)
   sample_vj_pairs(vj_dist, chain_letter, n_pairs, step_dir, cdr3_baseline)
 
+  # (1b) Carry the SAME correction into the length posterior and the PSSM.
+  # Without this, the decoy correction only reshapes which V/J get sampled while
+  # (2) and (3) are still estimated from the raw, artifact-contaminated top set.
+  # Per TCR the weight is the fraction of its gene's passes that are excess over
+  # that gene's decoy background -- the same quantity (1) uses, applied per row:
+  #     w(g) = max(0, n_top(g) - n_all(g)*bg(g)) / n_top(g)      in [0, 1]
+  # A gene passing exactly at its decoy rate contributes nothing; a gene with no
+  # decoy propensity keeps full weight. V and J weights multiply, matching the
+  # factorized treatment in (1). No decoy -> all weights 1 -> exact no-op.
+  tcr_weights <- rep(1, nrow(top_tcrs))
+  if (!is.null(decoy_bg)) {
+    p_global <- nrow(top_tcrs) / nrow(scored)
+    gene_w <- function(gt, bg_p, bg_n) {
+      col   <- paste0("TR", chain_letter, gt)
+      n_all <- table(scored[[col]][!is.na(scored[[col]])])
+      n_top <- table(top_tcrs[[col]][!is.na(top_tcrs[[col]])])
+      vapply(top_tcrs[[col]], function(g) {
+        if (is.na(g) || !(g %in% names(n_top))) return(1)
+        nt <- as.numeric(n_top[[g]])
+        na <- if (g %in% names(n_all)) as.numeric(n_all[[g]]) else 0
+        bg <- if (!is.null(bg_p) && g %in% names(bg_p) && bg_n[[g]] >= DECOY_MIN_N)
+                bg_p[[g]] else p_global
+        if (nt <= 0) 0 else min(1, max(0, (nt - na * bg) / nt))
+      }, numeric(1))
+    }
+    tcr_weights <- gene_w("V", decoy_bg$V, decoy_bg$n_V) *
+                   gene_w("J", decoy_bg$J, decoy_bg$n_J)
+    message(sprintf("  decoy weights (chain %s): mean=%.2f  zero-weight TCRs=%d/%d",
+                    chain_letter, mean(tcr_weights), sum(tcr_weights == 0), length(tcr_weights)))
+  }
+
   # (2) Marginal CDR3 length distribution (excess-over-background shrunk to the
   # baseline length prior, strength = len_prior_strength)
   len_dist <- extract_cdr3_len_dist(top_tcrs, scored, chain_letter,
-                                    len_baseline_prior[[chain_letter]], len_prior_strength)
+                                    len_baseline_prior[[chain_letter]], len_prior_strength,
+                                    weights = tcr_weights)
 
   # (3) PSSM from top binders' CDR3s
   cdr3_col <- paste0("cdr3_TR", chain_letter)
   if (nrow(top_tcrs) >= min_tcrs_pssm) {
-    cdr3_pssm <- build_cdr3_pssm(top_tcrs[[cdr3_col]])
+    cdr3_pssm <- build_cdr3_pssm(top_tcrs[[cdr3_col]], weights = tcr_weights)
     message(sprintf("  PSSM built from %d top binders (chain %s)", nrow(top_tcrs), chain_letter))
   } else {
     cdr3_pssm <- NULL
@@ -1185,6 +1281,7 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   cdr3_file <- file.path(step_dir, sprintf("TR%sV_TR%sJ_cdr3.csv", chain_letter, chain_letter))
   sample_chain_cdr3_multi(chain_tr, pair_file, cdr3_baseline, cdr3_file,
                            n = n_cdr3_multi, len_dist = len_dist,
+                           len_baseline = len_baseline_prior[[chain_letter]],
                            cdr3_pssm = cdr3_pssm, mut_weight = mut_weight)
 
   df_chain  <- read.csv(cdr3_file)

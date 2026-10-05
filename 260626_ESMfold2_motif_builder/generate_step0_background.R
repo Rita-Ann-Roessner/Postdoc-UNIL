@@ -1,21 +1,30 @@
 # =============================================================================
-# Step-0 background replicates
+# Step-0 background (decoy) repertoire
 #
-# Generate N independent flat-baseline step-0 repertoires (identical V/J grid,
-# FRESH random CDR3s each replicate) for a decoy peptide. Fold all replicates on
-# the cluster, then average per-V / per-length ESMFold pass rates across them
-# (analyze_step0_background.R) to get a low-noise, CDR3-agnostic background bg(g).
+# Folds the FIXED step-0 panel (step0_panel/, via STEP0_PANEL) against a decoy
+# peptide. Because it is the same panel every cognate epitope uses, each TCR is
+# scored against both its cognate peptide and the decoy, so
+#       score(t, cognate) - score(t, decoy)
+# is a paired, per-TCR contrast with no CDR3 sampling noise in it at all.
 #
-# Decoy = a neutral, non-cognate peptide (Option C: A2 anchors + poly-Ala TCR
-# face, "ALAAAAAAV"), so bg(g) isolates the epitope-INDEPENDENT ESMFold fold
-# artifact (what we want to subtract) rather than real germline-encoded
-# specificity for a cognate epitope. Works for any peptide, though.
+# No replicates: replicates existed to average over independent CDR3 draws, which
+# the fixed panel makes unnecessary for a paired contrast (and the panel already
+# carries ~50 alpha TCRs per V gene). If you ever do need CDR3-averaged per-gene
+# rates -- mainly for beta, which only gets ~13 TCRs per gene -- set
+# STEP0_PANEL <- NULL and loop this script over several seeds instead.
+#
+# Decoy = a neutral, non-cognate peptide (A2 anchors + poly-Ala TCR face,
+# "ALAAAAAAV"), so the background isolates the epitope-INDEPENDENT fold artifact
+# rather than real germline-encoded specificity. Works for any peptide, though.
+#
+# NOTE: these folds inherit the current CDR3_TEMPLATED setting. Do not pool them
+# with the archived pre-templating replicates in bck.step0_background/.
 #
 # Workflow:
-#   Rscript generate_step0_background.R        # make rep1..N step-0 batches
-#   (fold each rep's model_{alpha,beta}_seqs.csv on the cluster; place results
-#    as output_{alpha,beta}.csv beside the models)
-#   Rscript analyze_step0_background.R         # pool -> bg(g) table + artifact check
+#   Rscript generate_step0_background.R        # write the decoy batch
+#   (fold <OUT_DIR>/<label>/step0/model_{alpha,beta}_seqs.csv on the cluster;
+#    place results as output_{alpha,beta}.csv beside the models)
+#   Rscript analyze_step0_background.R         # -> bg(g) tables + artifact check
 # =============================================================================
 
 .sourced_for_benchmark <- TRUE
@@ -23,35 +32,38 @@ source("ESM_motif_builder.R")   # functions + setup (cdr3_baseline, INPUT_DIR); 
 
 # ---- config -----------------------------------------------------------------
 OUT_DIR     <- "step0_background"
-N_REPS      <- 3
-BASE_SEED   <- 100
 # "MHC_PEPTIDE" labels (same convention as `epitopes`). Decoy peptide:
-#   ALAAAAAAV  Option C: neutral, featureless poly-Ala TCR face (anchors L2/V9)
+#   ALAAAAAAV  neutral, featureless poly-Ala TCR face (A2 anchors L2/V9)
 BG_PEPTIDES <- c("A0201_ALAAAAAAV")
 
+if (is.null(STEP0_PANEL) || !nzchar(STEP0_PANEL))
+  stop("STEP0_PANEL is not set. This script folds the fixed panel against the decoy;\n",
+       "without a panel the background would not be paired with the cognate runs.")
+if (!file.exists(file.path(STEP0_PANEL, "model_alpha.csv")))
+  stop(sprintf("Panel '%s' not found. Create it once with: Rscript generate_step0_panel.R",
+               STEP0_PANEL))
+
 # ---- generate ---------------------------------------------------------------
-for (r in seq_len(N_REPS)) {
-  set.seed(BASE_SEED + r)                       # distinct, reproducible repertoire
-  rep_dir <- file.path(OUT_DIR, sprintf("rep%d", r))
+for (ep in BG_PEPTIDES) {
+  mhc        <- sub("_.*", "", ep)
+  peptide    <- sub("^[^_]*_", "", ep)
+  mhc_allele <- if (grepl("^HLA_", mhc)) mhc else paste0("HLA_", mhc)
 
-  for (ep in BG_PEPTIDES) {
-    mhc        <- sub("_.*", "", ep)
-    peptide    <- sub("^[^_]*_", "", ep)
-    mhc_allele <- if (grepl("^HLA_", mhc)) mhc else paste0("HLA_", mhc)
-
-    message(sprintf("\n[rep %d/%d | %s] generating step-0 background repertoire",
-                    r, N_REPS, ep))
-    run_step0(
-      peptide         = peptide,
-      mhc_allele      = mhc_allele,
-      label           = ep,
-      cdr3_baseline   = cdr3_baseline,
-      base_output_dir = rep_dir,
-      input_dir       = INPUT_DIR
-    )
-  }
+  message(sprintf("\n[%s] decoy background from panel '%s'", ep, STEP0_PANEL))
+  run_step0(
+    peptide         = peptide,
+    mhc_allele      = mhc_allele,
+    label           = ep,
+    cdr3_baseline   = cdr3_baseline,
+    base_output_dir = OUT_DIR,
+    input_dir       = INPUT_DIR,
+    panel_dir       = STEP0_PANEL      # explicit: same TCRs as every cognate run
+  )
 }
 
 message(sprintf(
-  "\nDone. Fold each replicate on the cluster:\n  %s/rep*/<label>/step0/model_{alpha,beta}_seqs.csv\nthen place ESMFold results as output_{alpha,beta}.csv beside the models and run:\n  Rscript analyze_step0_background.R",
-  OUT_DIR))
+  paste0("\nDone. Fold on the cluster:\n  %s/<label>/step0/model_{alpha,beta}_seqs.csv\n",
+         "then place results as output_{alpha,beta}.csv beside the models and run:\n",
+         "  Rscript analyze_step0_background.R\n\n",
+         "DECOY_DIR in ESM_motif_builder.R must point at '%s'."),
+  OUT_DIR, OUT_DIR))
