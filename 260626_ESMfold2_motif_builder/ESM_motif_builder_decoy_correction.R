@@ -42,7 +42,7 @@ STEP            <- 1        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated" 
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_decoy_correction" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
@@ -91,7 +91,7 @@ STEP0_PANEL <- "step0_panel"
 # step's own selection threshold from the decoy step-0 fold.
 # Every gene present in the decoy fold uses its own rate, however few observations
 # back it; only genes absent from the decoy fall back to p_global.
-DECOY_CORRECTION_VJ  <- FALSE                       # correct the V/J excess null background
+DECOY_CORRECTION_VJ  <- TRUE                        # correct the V/J excess null background
 DECOY_DIR        <- "step0_background"             # holds <decoy_label>/step0 folds
 DECOY_BY_MHC     <- c(A0201 = "A0201_ALAAAAAAV")   # MHC (allele w/o HLA_ prefix) -> decoy label
 
