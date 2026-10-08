@@ -13,3 +13,12 @@ for (c in 0:1){
   print(out_path)
   MixTCRviz(input1=tmp, output.path = out_path)
 }
+
+# additional TSP: major binding mode (cluster 0) with the CDR3 motif shown
+# after SUBTRACTING the baseline repertoire (plot.cdr3.norm = 1)
+maj = df[df$cluster == 0, c('TRAV','TRAJ','cdr3_TRA','TRBV','TRBJ','cdr3_TRB','model')]
+MixTCRviz(input1 = maj,
+          output.path    = "TSPs_major_cdr3subtract",
+          plot.cdr3.norm = 1,            # 1 = subtract baseline from the CDR3 motif
+          logo.type      = "probability")  # 'probability' = columns not scaled by information content (vs 'bits')
+
