@@ -42,23 +42,22 @@ STEP            <- 1        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated" 
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_mod_length" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
-#ESM_THRESHOLDS  <- c(0.5, 0.6, 0.7) #c(0.5, 0.6, 0.7, 0.7)
-ESM_THRESHOLDS  <- c(0.5, 0.6, 0.7)
+ESM_THRESHOLDS  <- c(0.5, 0.6, 0.65)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
 MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
 VJ_PRIOR_STRENGTH  <- 60   # alpha: repertoire-prior pseudocount weight for V/J shrinkage
                            # (in evidence-count units; higher = more shrinkage toward baseline)
-LEN_PRIOR_STRENGTH <- 20   # beta: same idea, for the CDR3-length enrichment shrinkage
-LEN_ENRICH_MAX_FOLD <- 10  # cap on the global length enrichment factor applied to a V/J
-                           # pair's own baseline length distribution (see
-                           # draw_random_cdr3_multi). Keeps a rare length whose global
-                           # posterior/baseline ratio is extreme from hijacking generation.
+LEN_WEIGHT_K     <- 5      # pseudocount in the per-length enrichment weight
+                           #   w(L) = (n_top(L) + k) / (n_all(L)*p_global + k)
+                           # Pulls lengths with few observations toward neutral (w=1).
+                           # Replaces the former LEN_PRIOR_STRENGTH / LEN_ENRICH_MAX_FOLD:
+                           # the ratio is intrinsically bounded, so no cap is needed.
 
 # --- Germline-templated CDR3 generation (Module 3b) --------------------------
 # TRUE  = build each CDR3 as  V-germline block + junction + J-germline block,
@@ -547,7 +546,7 @@ assemble_templated_cdr3 <- function(chain, v_seg, j_seg, base_prob, junc_src = b
 # =============================================================================
 
 draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
-                                    n = 5, len_dist = NULL, len_baseline = NULL,
+                                    n = 5, len_weight = NULL,
                                     cdr3_pssm = NULL, mut_weight = 0) {
   key <- paste0(v_seg, "_", j_seg)
   if (!key %in% names(cdr3_baseline[[chain]])) return(character(0))
@@ -555,16 +554,15 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
   vj_counts         <- cdr3_baseline[[chain]][[key]]
   lengths_available <- names(vj_counts)
 
-  # ---- length weights: THIS pair's own baseline, modulated by global enrichment
+  # ---- length: THIS pair's own baseline, tilted by the per-length enrichment ---
   # CDR3 length is largely determined by the J gene (per-J mean CDR3a length spans
-  # 10.1-14.0 while within-J sd is 0.4-1.6), so a length posterior pooled over all
-  # V/J pairs is badly mis-conditioned for any single pair. Instead use the pair's
-  # own baseline (exactly what step 0 does) and reweight it by how much the global
-  # enrichment favours each length over the global baseline:
-  #     P(L | V,J)  ∝  count_pair(L)  *  len_dist(L) / len_baseline(L)
-  # With no enrichment (len_dist == len_baseline) the factor is 1 and this reduces
-  # to step 0's behaviour. Lengths absent from either global table get factor 1
-  # (neutral) rather than being dropped.
+  # 10.1-14.0 while within-J sd is 0.4-1.6), so a length distribution pooled over
+  # all V/J pairs is badly mis-conditioned for any single pair. Use the pair's own
+  # baseline (exactly what step 0 does) and tilt it by how much better that length
+  # performed than the pool average (extract_cdr3_len_weight):
+  #     P(L | V,J)  ∝  count_pair(L)  *  w(L)
+  # w = 1 is neutral, so with no enrichment this reduces to step 0's behaviour.
+  # Lengths absent from the weight table get 1 rather than being dropped.
   pair_cnt <- vapply(lengths_available,
                      function(l) sum(vj_counts[[l]][, 1], na.rm = TRUE), numeric(1))
   names(pair_cnt) <- lengths_available
@@ -572,14 +570,9 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
 
   if (length(valid_lens) > 0) {
     w <- rep(1, length(valid_lens)); names(w) <- valid_lens
-    if (!is.null(len_dist) && !is.null(len_baseline)) {
-      for (l in valid_lens) {
-        d <- if (l %in% names(len_dist))     as.numeric(len_dist[[l]])     else NA_real_
-        b <- if (l %in% names(len_baseline)) as.numeric(len_baseline[[l]]) else NA_real_
-        if (!is.na(d) && !is.na(b) && b > 0)
-          # cap the fold-change: a rare length can otherwise hijack generation
-          w[[l]] <- min(max(d / b, 1 / LEN_ENRICH_MAX_FOLD), LEN_ENRICH_MAX_FOLD)
-      }
+    if (!is.null(len_weight)) {
+      for (l in valid_lens)
+        if (l %in% names(len_weight)) w[[l]] <- as.numeric(len_weight[[l]])
     }
     probs <- pair_cnt[valid_lens] * w
   } else {
@@ -588,11 +581,14 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
 
   if (length(valid_lens) > 0 && sum(probs) > 0) {
     probs         <- probs / sum(probs)
-    selected_lens <- sample(valid_lens, size = min(n, sum(probs > 0)),
-                            replace = FALSE, prob = probs)
+    # WITH replacement: the realised length distribution then converges on probs.
+    # Drawing n DISTINCT lengths (the previous behaviour) capped any single length
+    # at 1/n of the batch regardless of how strongly the pair's prior favoured it,
+    # which made a concentrated preference (e.g. LLW alpha, 52% at L=10) unreachable.
+    selected_lens <- sample(valid_lens, size = n, replace = TRUE, prob = probs)
   } else {
     # pair has no usable length counts at all -> uniform over whatever it supports
-    selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
+    selected_lens <- sample(lengths_available, size = n, replace = TRUE)
   }
 
   seqs <- vapply(selected_lens, function(len_name) {
@@ -696,7 +692,7 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
 
 
 sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file,
-                                     n = 5, len_dist = NULL, len_baseline = NULL,
+                                     n = 5, len_weight = NULL,
                                      cdr3_pssm = NULL, mut_weight = 0) {
   df           <- read.csv(pair_file)
   chain_letter <- sub("^TR", "", chain)
@@ -706,11 +702,10 @@ sample_chain_cdr3_multi <- function(chain, pair_file, cdr3_baseline, output_file
   results <- mapply(draw_random_cdr3_multi,
                     chain = chain, v_seg = df[[v_col]], j_seg = df[[j_col]],
                     MoreArgs = list(cdr3_baseline = cdr3_baseline,
-                                   n            = n,
-                                   len_dist     = len_dist,
-                                   len_baseline = len_baseline,
-                                   cdr3_pssm    = cdr3_pssm,
-                                   mut_weight   = mut_weight),
+                                   n          = n,
+                                   len_weight = len_weight,
+                                   cdr3_pssm  = cdr3_pssm,
+                                   mut_weight = mut_weight),
                     SIMPLIFY = FALSE)
 
   df_exp <- data.frame(
@@ -933,18 +928,32 @@ sample_vj_pairs <- function(vj_dist, chain_letter, n_pairs, output_dir, cdr3_bas
 }
 
 
-# Marginal CDR3-length distribution, same excess-over-background + baseline
-# shrinkage as the V/J marginals (a raw freq_top/freq_all ratio blows up at rare
-# lengths and, with with-replacement length sampling, hijacks generation toward
-# spurious extreme lengths):
-#   posterior(L) ∝ alpha * P_baseline_len(L) + max(0, n_top(L) - n_all(L) * p_global)
-# alpha = len_prior_strength. Returns a named list over "L_<n>" keys.
-# `weights` (one per top-binder row, default 1) carries the decoy correction into
-# the length posterior: passers from decoy-prone genes count for less. The global
-# pass rate is weighted the same way so excess stays on a consistent scale.
-# All-1 weights reproduce the uncorrected counts exactly.
-extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter, len_baseline_prior, alpha,
-                                  weights = NULL) {
+# Per-length enrichment WEIGHT: how much better or worse CDR3s of length L passed
+# than the pool average. Multiplies a V/J pair's own baseline length distribution
+# in draw_random_cdr3_multi, so w = 1 means "this length performed exactly at the
+# pool average -> leave the pair's prior alone".
+#
+#   w(L) = (n_top(L) + k) / (n_all(L) * p_global + k)
+#
+# This replaces the former excess-over-background posterior
+#   max(0, n_top - n_all*p_global), normalised against P_baseline_len,
+# whose max(0, .) clipped every below-average length to exactly 0. Those lengths
+# then all collapsed to one identical weight (0.35 for alpha, 0.31 for beta),
+# discarding the ordering across ~half the data -- and always the LONG half, since
+# the pass rate falls monotonically with length. That asymmetry is what drove the
+# ~1.5-residue-per-step drift toward short CDR3s.
+#
+# The ratio keeps the ordering on both sides of the average, is intrinsically
+# bounded (no cap needed), and needs no repertoire baseline: the pair's own
+# counts already supply that in draw_random_cdr3_multi.
+# k is a pseudocount so a length with few observations is pulled toward neutral
+# (alpha L=9 with 2/5 would otherwise read 3.5x; with k=5 it reads 1.26x).
+# `weights` (one per top-binder row, default 1) carries the decoy correction in:
+# passers from decoy-prone genes count for less. p_global is weighted the same
+# way so the comparison stays on a consistent scale. All-1 weights = uncorrected.
+# Returns a named list over "L_<n>" keys.
+extract_cdr3_len_weight <- function(top_tcrs, scored, chain_letter, k = LEN_WEIGHT_K,
+                                    weights = NULL) {
   cdr3_col <- paste0("cdr3_TR", chain_letter)
   if (!cdr3_col %in% colnames(top_tcrs)) return(NULL)
   if (is.null(weights)) weights <- rep(1, nrow(top_tcrs))
@@ -958,15 +967,14 @@ extract_cdr3_len_dist <- function(top_tcrs, scored, chain_letter, len_baseline_p
   n_all    <- table(paste0("L_", La))
   p_global <- sum(wt) / length(La)
 
-  lens   <- names(len_baseline_prior)
-  excess <- vapply(lens, function(l) {
-    nt <- if (l %in% names(n_top)) n_top[[l]] else 0
-    na <- if (l %in% names(n_all)) n_all[[l]] else 0
-    max(0, nt - na * p_global)
+  lens <- union(names(n_all), names(n_top))
+  w <- vapply(lens, function(l) {
+    nt <- if (l %in% names(n_top)) as.numeric(n_top[[l]]) else 0
+    na <- if (l %in% names(n_all)) as.numeric(n_all[[l]]) else 0
+    (nt + k) / (na * p_global + k)
   }, numeric(1))
-  posterior <- alpha * unlist(len_baseline_prior) + excess
-  if (sum(posterior) == 0) return(NULL)
-  as.list(posterior / sum(posterior))
+  if (!length(w)) return(NULL)
+  as.list(w)
 }
 
 
@@ -1161,7 +1169,6 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
                               base_output_dir, cdr3_baseline,
                               n_pairs, n_cdr3_multi, min_tcrs_pssm,
                               vj_baseline_prior, vj_prior_strength,
-                              len_baseline_prior, len_prior_strength,
                               threshold, mut_weight = 0) {
 
   chain_name    <- if (chain_letter == "A") "alpha" else "beta"
@@ -1242,11 +1249,10 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
                     chain_letter, mean(tcr_weights), sum(tcr_weights == 0), length(tcr_weights)))
   }
 
-  # (2) Marginal CDR3 length distribution (excess-over-background shrunk to the
-  # baseline length prior, strength = len_prior_strength)
-  len_dist <- extract_cdr3_len_dist(top_tcrs, scored, chain_letter,
-                                    len_baseline_prior[[chain_letter]], len_prior_strength,
-                                    weights = tcr_weights)
+  # (2) Per-length enrichment weight (ratio to the pool average; see
+  # extract_cdr3_len_weight). Tilts each V/J pair's own length distribution.
+  len_weight <- extract_cdr3_len_weight(top_tcrs, scored, chain_letter,
+                                        k = LEN_WEIGHT_K, weights = tcr_weights)
 
   # (3) PSSM from top binders' CDR3s
   cdr3_col <- paste0("cdr3_TR", chain_letter)
@@ -1263,8 +1269,7 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   pair_file <- file.path(step_dir, sprintf("TR%sV_TR%sJ.csv", chain_letter, chain_letter))
   cdr3_file <- file.path(step_dir, sprintf("TR%sV_TR%sJ_cdr3.csv", chain_letter, chain_letter))
   sample_chain_cdr3_multi(chain_tr, pair_file, cdr3_baseline, cdr3_file,
-                           n = n_cdr3_multi, len_dist = len_dist,
-                           len_baseline = len_baseline_prior[[chain_letter]],
+                           n = n_cdr3_multi, len_weight = len_weight,
                            cdr3_pssm = cdr3_pssm, mut_weight = mut_weight)
 
   df_chain  <- read.csv(cdr3_file)
@@ -1283,7 +1288,6 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
                              cdr3_baseline, base_output_dir,
                              n_pairs, n_cdr3_multi, min_tcrs_pssm,
                              vj_baseline_prior, vj_prior_strength,
-                             len_baseline_prior, len_prior_strength,
                              esm_thresholds, species = "HomoSapiens", mut_weight = 0,
                              plot_each_step     = PLOT_EACH_STEP,
                              validate_each_step = VALIDATE_EACH_STEP,
@@ -1299,13 +1303,11 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
                                 base_output_dir, cdr3_baseline,
                                 n_pairs, n_cdr3_multi, min_tcrs_pssm,
                                 vj_baseline_prior, vj_prior_strength,
-                                len_baseline_prior, len_prior_strength,
                                 threshold, mut_weight)
   top_beta  <- enrich_one_chain("B", step, label, peptide, mhc_allele, species,
                                 base_output_dir, cdr3_baseline,
                                 n_pairs, n_cdr3_multi, min_tcrs_pssm,
                                 vj_baseline_prior, vj_prior_strength,
-                                len_baseline_prior, len_prior_strength,
                                 threshold, mut_weight)
 
   # Optional: MixTCRviz motif plots — saved into prev_step_dir (scores source)
@@ -1487,8 +1489,6 @@ for (epitope in epitopes) {
         min_tcrs_pssm              = MIN_TCRS_PSSM,
         vj_baseline_prior          = vj_baseline_prior,
         vj_prior_strength          = VJ_PRIOR_STRENGTH,
-        len_baseline_prior         = len_baseline_prior,
-        len_prior_strength         = LEN_PRIOR_STRENGTH,
         esm_thresholds             = ESM_THRESHOLDS,
         plot_each_step             = PLOT_EACH_STEP,
         validate_each_step         = VALIDATE_EACH_STEP,
