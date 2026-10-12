@@ -38,11 +38,11 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 1        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 0        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 5         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_mod_length" 
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_dana" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
@@ -51,8 +51,12 @@ ESM_THRESHOLDS  <- c(0.5, 0.6, 0.65)
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
 MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
-VJ_PRIOR_STRENGTH  <- 60   # alpha: repertoire-prior pseudocount weight for V/J shrinkage
-                           # (in evidence-count units; higher = more shrinkage toward baseline)
+VJ_WEIGHT_K      <- 5      # pseudocount in the per-gene enrichment weight
+                           #   w(g) = (n_top(g) + k) / (n_all(g)*bg(g) + k)
+                           # posterior(g) = P_baseline(g) * w(g). Higher k = a gene needs
+                           # more of its own evidence to move off the repertoire prior.
+                           # Replaces the former VJ_PRIOR_STRENGTH (an additive alpha,
+                           # whose per-gene effect depended on how many genes a segment has).
 LEN_WEIGHT_K     <- 5      # pseudocount in the per-length enrichment weight
                            #   w(L) = (n_top(L) + k) / (n_all(L)*p_global + k)
                            # Pulls lengths with few observations toward neutral (w=1).
@@ -71,6 +75,19 @@ JUNCTION_PSSM   <- FALSE   # TRUE = let the top-binder PSSM shape the junction r
                            # top-binder information enters the CDR3 sequence at all
                            # (enrichment then acts solely via V/J and length choice).
 TEMPLATE_MAX_TRIES <- 20   # redraws allowed when v_ext + j_ext would exceed L
+
+# Where the trimming extents come from (Module 3a):
+#   "survival" = extent distribution read off the V/J/L baseline PWM alone.
+#   "figure"   = same distribution, but SHIFTED so its mode lands on the modal
+#                post-trimming germline extent for that chain and length, as
+#                measured off the iReceptor panel of the V/J-vs-CDR3-length
+#                figure (FIG_EXT below). Spread and per-gene conditioning are
+#                preserved; only the centre moves.
+# Measured effect of "figure" over the step-0 panel:
+#   alpha  V+J 80.7% -> 87.8% of the CDR3 (junction 2.68 -> 1.69 residues)
+#   beta   V+J 65.9% -> 71.4%             (junction 5.08 -> 4.26 residues)
+# J moves ~2.7x as much as V on both chains, which is the intended bias.
+EXTENT_SOURCE <- "figure"
 
 # --- Fixed step-0 panel ------------------------------------------------------
 # Path to a one-off generated step-0 repertoire reused for EVERY epitope, so that
@@ -456,6 +473,35 @@ germline_cdr3_part <- function(seg, gene, germline = GERMLINE_CDR3) {
   NA_character_
 }
 
+# Modal post-trimming germline extents by chain and CDR3 length, read off the
+# iReceptor panel (A) of the V/J-contribution-vs-CDR3-length figure by measuring
+# each bubble and taking the row-wise argmax. These are POST-trimming counts, so
+# they are directly comparable to v_ext / j_ext.
+#
+# Confidence is uneven. L_Ja is the only panel with real signal (R = 0.446) and
+# iReceptor and VDJdb agree on it residue-for-residue across all nine lengths;
+# L_Va agrees between datasets to within one residue. The two beta columns rest
+# on iReceptor alone -- VDJdb's beta panels are saturated (all three columns
+# measure 16-17 px) and cannot be read. Beta's J values also sit above what the
+# validation positives show, possibly an annotation-convention difference in how
+# ambiguous junction residues are split between D and J; revisit if beta motifs
+# degrade. Outside L = 10-18 the bubbles are too small to measure, so L is
+# clamped rather than extrapolated.
+FIG_EXT <- list(
+  A = list(V = c(`10`=3,`11`=3,`12`=3,`13`=3,`14`=4,`15`=5,`16`=5,`17`=5,`18`=5),
+           J = c(`10`=7,`11`=7,`12`=8,`13`=9,`14`=9,`15`=10,`16`=11,`17`=12,`18`=12)),
+  B = list(V = c(`10`=4,`11`=4,`12`=4,`13`=4,`14`=4,`15`=5,`16`=6,`17`=6,`18`=6),
+           J = c(`10`=6,`11`=6,`12`=6,`13`=6,`14`=6,`15`=7,`16`=7,`17`=8,`18`=8))
+)
+
+# Target (v_ext, j_ext) for one chain letter and CDR3 length; NULL if unknown.
+fig_extent <- function(chain_letter, L) {
+  tb <- FIG_EXT[[chain_letter]]
+  if (is.null(tb)) return(NULL)
+  Lc <- as.character(max(10L, min(18L, as.integer(L))))
+  c(v = unname(tb$V[[Lc]]), j = unname(tb$J[[Lc]]))
+}
+
 # P(extent = i) for i = 1..length(surv), from a survival curve P(extent >= i).
 # cummin enforces the nesting constraint (if position 3 is templated, 1 and 2 are
 # too) and incidentally denoises the PWM estimate. Extent 0 is excluded on
@@ -473,7 +519,8 @@ germline_cdr3_part <- function(seg, gene, germline = GERMLINE_CDR3) {
 # for this V/J pair at this length. Returns NULL if no valid (non-overlapping)
 # pair of extents can be drawn.
 sample_extents <- function(prob_mat, v_tmpl, j_tmpl, L,
-                           max_tries = TEMPLATE_MAX_TRIES) {
+                           max_tries = TEMPLATE_MAX_TRIES,
+                           chain_letter = NULL) {
   aas <- rownames(prob_mat)
   surv_at <- function(res, pos) if (res %in% aas && pos >= 1 && pos <= L) prob_mat[res, pos] else 0
 
@@ -493,14 +540,30 @@ sample_extents <- function(prob_mat, v_tmpl, j_tmpl, L,
   pv <- .extent_probs(surv_v); pj <- .extent_probs(surv_j)
   if (is.null(pv) || is.null(pj)) return(NULL)
 
+  # EXTENT_SOURCE == "figure": offset each draw so the distribution's mode lands
+  # on the figure's modal extent for this chain/length. The PWM still supplies
+  # the shape (and with it the per-gene trimming spread); only the centre moves.
+  # A target the gene cannot reach -- Jalpha = 12 against a 9-residue TRAJ12
+  # template -- is absorbed by the clamp to nv / nj.
+  off_v <- 0L; off_j <- 0L
+  if (identical(EXTENT_SOURCE, "figure") && !is.null(chain_letter)) {
+    tgt <- fig_extent(chain_letter, L)
+    if (!is.null(tgt)) {
+      off_v <- as.integer(tgt[["v"]]) - which.max(pv)
+      off_j <- as.integer(tgt[["j"]]) - which.max(pj)
+    }
+  }
+  draw_v <- function() max(1L, min(nv, sample(seq_len(nv), 1, prob = pv) + off_v))
+  draw_j <- function() max(1L, min(nj, sample(seq_len(nj), 1, prob = pj) + off_j))
+
   for (i in seq_len(max_tries)) {
-    v_ext <- sample(seq_len(nv), 1, prob = pv)
-    j_ext <- sample(seq_len(nj), 1, prob = pj)
+    v_ext <- draw_v()
+    j_ext <- draw_j()
     if (v_ext + j_ext <= L) return(list(v_ext = v_ext, j_ext = j_ext))
   }
   # persistent overlap (short L, long templates): keep V, clamp J to what fits,
   # never below 1 so the C-terminal F/W anchor stays germline
-  v_ext <- min(sample(seq_len(nv), 1, prob = pv), L - 1)
+  v_ext <- min(draw_v(), L - 1)
   list(v_ext = v_ext, j_ext = max(1, min(nj, L - v_ext)))
 }
 
@@ -521,7 +584,7 @@ assemble_templated_cdr3 <- function(chain, v_seg, j_seg, base_prob, junc_src = b
   if (is.na(v_tmpl) || is.na(j_tmpl)) return(NA_character_)
 
   L   <- ncol(base_prob)
-  ext <- sample_extents(base_prob, v_tmpl, j_tmpl, L)
+  ext <- sample_extents(base_prob, v_tmpl, j_tmpl, L, chain_letter = cl)
   if (is.null(ext)) return(NA_character_)
   n_junc <- L - ext$v_ext - ext$j_ext
   if (n_junc < 0) return(NA_character_)
@@ -581,14 +644,22 @@ draw_random_cdr3_multi <- function(chain, v_seg, j_seg, cdr3_baseline,
 
   if (length(valid_lens) > 0 && sum(probs) > 0) {
     probs         <- probs / sum(probs)
-    # WITH replacement: the realised length distribution then converges on probs.
-    # Drawing n DISTINCT lengths (the previous behaviour) capped any single length
-    # at 1/n of the batch regardless of how strongly the pair's prior favoured it,
-    # which made a concentrated preference (e.g. LLW alpha, 52% at L=10) unreachable.
-    selected_lens <- sample(valid_lens, size = n, replace = TRUE, prob = probs)
+    # n DISTINCT lengths (no replacement). This caps any single length at 1/n of
+    # the batch, so a strongly concentrated preference cannot be reproduced at
+    # generation time -- but it also damps the step-to-step feedback loop.
+    #
+    # Sampling WITH replacement was tried (TCR_motif_atlas_cdr3_templated_mod_length)
+    # and reverted: the realised distribution then follows `probs` faithfully, but
+    # `probs` is built from the PREVIOUS step's pass rates, so generation chases a
+    # one-step-stale, noisy ranking. For LLW alpha that meant 264 -> 45 TCRs at
+    # L=10 (the reference mode, and the best-performing length at 8.3%) and
+    # 189 -> 529 at the worst lengths, cutting the alpha pass rate 4.6% -> 2.2%.
+    # Keeping replacement off trades peak concentration for stability.
+    selected_lens <- sample(valid_lens, size = min(n, sum(probs > 0)),
+                            replace = FALSE, prob = probs)
   } else {
     # pair has no usable length counts at all -> uniform over whatever it supports
-    selected_lens <- sample(lengths_available, size = n, replace = TRUE)
+    selected_lens <- sample(lengths_available, size = min(n, length(lengths_available)))
   }
 
   seqs <- vapply(selected_lens, function(len_name) {
@@ -861,12 +932,28 @@ load_decoy_background <- function(chain_letter, mhc, threshold,
 # own decoy pass propensity, so a peptide-independent fold artifact isn't credited
 # as enrichment:
 #   bg(g)        = decoy_bg(g)  if supplied, else p_global
-#   excess(g)    = max(0, n_top(g) - n_all(g) * bg(g))       [excess over background]
-#   posterior(g) ∝ alpha * P_baseline(g) + excess(g)         [shrink to marginal prior]
-# decoy_bg = NULL reproduces the original p_global behaviour exactly.
+#   w(g)         = (n_top(g) + k) / (n_all(g)*bg(g) + k)     [smoothed rate ratio]
+#   posterior(g) ∝ P_baseline(g) * w(g)                      [tilt the marginal prior]
+#
+# This replaces the former additive, clipped form
+#   posterior(g) ∝ alpha*P_baseline(g) + max(0, n_top - n_all*bg)
+# which failed at both ends of the distribution:
+#  - BELOW background the max(0,.) erased performance entirely (39 of 45 alpha
+#    genes at GIL step1), leaving those genes ranked purely by naive repertoire
+#    frequency: TRAV13-1 passed 0/18 and got 2.8% of the posterior while TRAV27
+#    -- GIL's correct gene -- passed 1/9 (at background) and got 1.2%.
+#  - ABOVE background `excess` is a COUNT, so it scales with the slots a gene
+#    already holds: posterior ∝ slots * rate_advantage, i.e. geometric growth.
+#    TRAV12-2 ran 51 -> 261 -> 525 slots while TRAV27 collapsed to 9.
+# The ratio is bounded, keeps the ordering on both sides of background, and needs
+# no alpha: the prior is always present as a multiplicand, and k (not alpha) sets
+# how fast a gene's own evidence overrides it. k is in per-gene observation units,
+# so it also removes the old accidental asymmetry where alpha/n_genes gave TRBJ
+# (13 genes) 3.6x more shrinkage than TRAV (45 genes).
+# decoy_bg = NULL falls back to p_global for every gene.
 # Restricted to functional genes (marginal_prior names). Returns list(V, J) or NULL.
-extract_vj_marginal_posterior <- function(top_tcrs, scored, chain_letter, marginal_prior, alpha,
-                                           decoy_bg = NULL) {
+extract_vj_marginal_posterior <- function(top_tcrs, scored, chain_letter, marginal_prior,
+                                           k = VJ_WEIGHT_K, decoy_bg = NULL) {
   v_col <- paste0("TR", chain_letter, "V")
   j_col <- paste0("TR", chain_letter, "J")
   if (!all(c(v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
@@ -877,15 +964,15 @@ extract_vj_marginal_posterior <- function(top_tcrs, scored, chain_letter, margin
     n_top <- table(top_tcrs[[gene_col]][!is.na(top_tcrs[[gene_col]])])
     n_all <- table(scored[[gene_col]][!is.na(scored[[gene_col]])])
     genes <- names(prior)
-    excess <- vapply(genes, function(g) {
+    w <- vapply(genes, function(g) {
       nt <- if (g %in% names(n_top)) n_top[[g]] else 0
       na <- if (g %in% names(n_all)) n_all[[g]] else 0
       # decoy pass propensity as the null; fall back to the pooled global rate
       # only when no decoy background is supplied for this gene.
       bg <- if (!is.null(bg_p) && g %in% names(bg_p)) bg_p[[g]] else p_global
-      max(0, nt - na * bg)
+      (nt + k) / (na * bg + k)
     }, numeric(1))
-    posterior <- alpha * unlist(prior) + excess
+    posterior <- unlist(prior) * w
     if (sum(posterior) == 0) return(NULL)
     posterior / sum(posterior)
   }
@@ -1168,7 +1255,7 @@ run_step0 <- function(peptide, mhc_allele, label, cdr3_baseline,
 enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, species,
                               base_output_dir, cdr3_baseline,
                               n_pairs, n_cdr3_multi, min_tcrs_pssm,
-                              vj_baseline_prior, vj_prior_strength,
+                              vj_baseline_prior,
                               threshold, mut_weight = 0) {
 
   chain_name    <- if (chain_letter == "A") "alpha" else "beta"
@@ -1216,8 +1303,8 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   # combinations that have a CDR3 baseline. When DECOY_CORRECTION_VJ is on, the
   # excess null background is each gene's decoy pass propensity instead of p_global.
   vj_dist <- extract_vj_marginal_posterior(top_tcrs, scored, chain_letter,
-                                           vj_baseline_prior[[chain_letter]], vj_prior_strength,
-                                           decoy_bg)
+                                           vj_baseline_prior[[chain_letter]],
+                                           k = VJ_WEIGHT_K, decoy_bg = decoy_bg)
   sample_vj_pairs(vj_dist, chain_letter, n_pairs, step_dir, cdr3_baseline)
 
   # (1b) Carry the SAME correction into the length posterior and the PSSM.
@@ -1287,7 +1374,7 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
 run_enrich_step <- function(step, peptide, mhc_allele, label,
                              cdr3_baseline, base_output_dir,
                              n_pairs, n_cdr3_multi, min_tcrs_pssm,
-                             vj_baseline_prior, vj_prior_strength,
+                             vj_baseline_prior,
                              esm_thresholds, species = "HomoSapiens", mut_weight = 0,
                              plot_each_step     = PLOT_EACH_STEP,
                              validate_each_step = VALIDATE_EACH_STEP,
@@ -1302,12 +1389,12 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
   top_alpha <- enrich_one_chain("A", step, label, peptide, mhc_allele, species,
                                 base_output_dir, cdr3_baseline,
                                 n_pairs, n_cdr3_multi, min_tcrs_pssm,
-                                vj_baseline_prior, vj_prior_strength,
+                                vj_baseline_prior,
                                 threshold, mut_weight)
   top_beta  <- enrich_one_chain("B", step, label, peptide, mhc_allele, species,
                                 base_output_dir, cdr3_baseline,
                                 n_pairs, n_cdr3_multi, min_tcrs_pssm,
-                                vj_baseline_prior, vj_prior_strength,
+                                vj_baseline_prior,
                                 threshold, mut_weight)
 
   # Optional: MixTCRviz motif plots — saved into prev_step_dir (scores source)
@@ -1488,7 +1575,6 @@ for (epitope in epitopes) {
         n_cdr3_multi               = N_CDR3_MULTI,
         min_tcrs_pssm              = MIN_TCRS_PSSM,
         vj_baseline_prior          = vj_baseline_prior,
-        vj_prior_strength          = VJ_PRIOR_STRENGTH,
         esm_thresholds             = ESM_THRESHOLDS,
         plot_each_step             = PLOT_EACH_STEP,
         validate_each_step         = VALIDATE_EACH_STEP,

@@ -12,7 +12,7 @@
 set -euo pipefail
 
 REMOTE=rroessne@curnagl
-REMOTE_BASE=/scratch/rroessne/260626_ESMfold2_motif_builder/TCR_motif_atlas_cdr3_templated
+REMOTE_BASE=/scratch/rroessne/260626_ESMfold2_motif_builder/TCR_motif_atlas_cdr3_templated_mod_length
 
 # Which step's outputs to fetch. Pass the step number as the first arg
 # (e.g. ./download_outputs.sh 1); defaults to 1.
