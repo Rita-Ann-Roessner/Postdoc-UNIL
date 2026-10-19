@@ -38,25 +38,30 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 0        # 0, 1, ..., N_STEPS, or "final"
-N_STEPS         <- 5         # total number of enrichment steps after step 0
+STEP            <- 1        # 0, 1, ..., N_STEPS, or "final"
+N_STEPS         <- 2         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_dana" 
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_dana_orig_VJ" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
-ESM_THRESHOLDS  <- c(0.5, 0.6, 0.65)
+ESM_THRESHOLDS  <- c(0.5, 0.6)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
 MIN_TCRS_PSSM    <- 30     # min top binders required to build a PSSM
-VJ_WEIGHT_K      <- 5      # pseudocount in the per-gene enrichment weight
-                           #   w(g) = (n_top(g) + k) / (n_all(g)*bg(g) + k)
-                           # posterior(g) = P_baseline(g) * w(g). Higher k = a gene needs
-                           # more of its own evidence to move off the repertoire prior.
-                           # Replaces the former VJ_PRIOR_STRENGTH (an additive alpha,
-                           # whose per-gene effect depended on how many genes a segment has).
+VJ_PRIOR_STRENGTH <- 60    # α: repertoire-prior pseudocount weight for the V/J posterior,
+                           # in units of TCR counts -- roughly how much evidence a gene needs
+                           # before it moves off the repertoire baseline. The value used for
+                           # TCR_motif_atlas_cdr3_templated.
+                           # A multiplicative rate-ratio form was tried and removed: at the gene
+                           # level it was too noisy, because with ~47 TRAV / 61 TRAJ / 66 TRBV
+                           # genes and a few hundred passers many genes sit at low n_all, where a
+                           # ratio is unstable. Additive keeps rare genes pinned near the prior,
+                           # since their absolute excess is necessarily small. LENGTH still uses
+                           # the ratio form (LEN_WEIGHT_K) -- there the clipping was the binding
+                           # problem, not the noise.
 LEN_WEIGHT_K     <- 5      # pseudocount in the per-length enrichment weight
                            #   w(L) = (n_top(L) + k) / (n_all(L)*p_global + k)
                            # Pulls lengths with few observations toward neutral (w=1).
@@ -927,33 +932,31 @@ load_decoy_background <- function(chain_letter, mhc, threshold,
 # the marginal V and J effects (interaction ≈ 1), so V and J are modelled
 # INDEPENDENTLY. This credits enrichment to the gene that earned it and stops an
 # enriched V from dragging an unspecific "passenger" J along (and vice versa).
-# Per gene the null background is p_global (pooled pass rate) by default, OR — when
-# a decoy background is supplied (decoy_bg from load_decoy_background) — that gene's
+# Per gene the null background is p_global (pooled pass rate) by default, OR -- when
+# a decoy background is supplied (decoy_bg from load_decoy_background) -- that gene's
 # own decoy pass propensity, so a peptide-independent fold artifact isn't credited
 # as enrichment:
 #   bg(g)        = decoy_bg(g)  if supplied, else p_global
-#   w(g)         = (n_top(g) + k) / (n_all(g)*bg(g) + k)     [smoothed rate ratio]
-#   posterior(g) ∝ P_baseline(g) * w(g)                      [tilt the marginal prior]
+#   excess(g)    = max(0, n_top(g) - n_all(g)*bg(g))     [passers above the null]
+#   posterior(g) ∝ α*P_baseline(g) + excess(g)           [shrink toward the prior]
 #
-# This replaces the former additive, clipped form
-#   posterior(g) ∝ alpha*P_baseline(g) + max(0, n_top - n_all*bg)
-# which failed at both ends of the distribution:
-#  - BELOW background the max(0,.) erased performance entirely (39 of 45 alpha
-#    genes at GIL step1), leaving those genes ranked purely by naive repertoire
-#    frequency: TRAV13-1 passed 0/18 and got 2.8% of the posterior while TRAV27
-#    -- GIL's correct gene -- passed 1/9 (at background) and got 1.2%.
-#  - ABOVE background `excess` is a COUNT, so it scales with the slots a gene
-#    already holds: posterior ∝ slots * rate_advantage, i.e. geometric growth.
-#    TRAV12-2 ran 51 -> 261 -> 525 slots while TRAV27 collapsed to 9.
-# The ratio is bounded, keeps the ordering on both sides of background, and needs
-# no alpha: the prior is always present as a multiplicand, and k (not alpha) sets
-# how fast a gene's own evidence overrides it. k is in per-gene observation units,
-# so it also removes the old accidental asymmetry where alpha/n_genes gave TRBJ
-# (13 genes) 3.6x more shrinkage than TRAV (45 genes).
+# Known costs of this form, measured at GIL step 1 -- kept deliberately, but do not
+# re-derive them from scratch:
+#  - BELOW background max(0,.) erases performance entirely (39 of 45 alpha genes),
+#    leaving those genes ranked purely by naive repertoire frequency: TRAV13-1
+#    passed 0/18 and got 2.8% of the posterior while TRAV27 -- GIL's correct gene --
+#    passed 1/9 (at background) and got 1.2%.
+#  - ABOVE background `excess` is a COUNT, so it scales with the slots a gene already
+#    holds: posterior ∝ slots * rate_advantage, i.e. geometric growth. TRAV12-2 ran
+#    51 -> 261 -> 525 slots while TRAV27 collapsed to 9.
+#  - α is a total pseudocount spread over the prior, so α/n_genes gives TRBJ
+#    (13 genes) ~3.6x more shrinkage per gene than TRAV (45 genes).
+# A rate-ratio form fixed all three but was too noisy at the gene level; see
+# VJ_PRIOR_STRENGTH. Length still uses the ratio (extract_cdr3_len_weight).
 # decoy_bg = NULL falls back to p_global for every gene.
 # Restricted to functional genes (marginal_prior names). Returns list(V, J) or NULL.
 extract_vj_marginal_posterior <- function(top_tcrs, scored, chain_letter, marginal_prior,
-                                           k = VJ_WEIGHT_K, decoy_bg = NULL) {
+                                           alpha = VJ_PRIOR_STRENGTH, decoy_bg = NULL) {
   v_col <- paste0("TR", chain_letter, "V")
   j_col <- paste0("TR", chain_letter, "J")
   if (!all(c(v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
@@ -964,15 +967,16 @@ extract_vj_marginal_posterior <- function(top_tcrs, scored, chain_letter, margin
     n_top <- table(top_tcrs[[gene_col]][!is.na(top_tcrs[[gene_col]])])
     n_all <- table(scored[[gene_col]][!is.na(scored[[gene_col]])])
     genes <- names(prior)
-    w <- vapply(genes, function(g) {
-      nt <- if (g %in% names(n_top)) n_top[[g]] else 0
-      na <- if (g %in% names(n_all)) n_all[[g]] else 0
-      # decoy pass propensity as the null; fall back to the pooled global rate
-      # only when no decoy background is supplied for this gene.
-      bg <- if (!is.null(bg_p) && g %in% names(bg_p)) bg_p[[g]] else p_global
-      (nt + k) / (na * bg + k)
-    }, numeric(1))
-    posterior <- unlist(prior) * w
+    # counts and the per-gene null, shared by both modes
+    nt_v <- vapply(genes, function(g) if (g %in% names(n_top)) as.numeric(n_top[[g]]) else 0, numeric(1))
+    na_v <- vapply(genes, function(g) if (g %in% names(n_all)) as.numeric(n_all[[g]]) else 0, numeric(1))
+    # decoy pass propensity as the null; fall back to the pooled global rate
+    # only when no decoy background is supplied for this gene.
+    bg_v <- vapply(genes, function(g)
+      if (!is.null(bg_p) && g %in% names(bg_p)) as.numeric(bg_p[[g]]) else p_global, numeric(1))
+
+    excess    <- pmax(0, nt_v - na_v * bg_v)
+    posterior <- alpha * unlist(prior) + excess
     if (sum(posterior) == 0) return(NULL)
     posterior / sum(posterior)
   }
@@ -1304,7 +1308,7 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
   # excess null background is each gene's decoy pass propensity instead of p_global.
   vj_dist <- extract_vj_marginal_posterior(top_tcrs, scored, chain_letter,
                                            vj_baseline_prior[[chain_letter]],
-                                           k = VJ_WEIGHT_K, decoy_bg = decoy_bg)
+                                           alpha = VJ_PRIOR_STRENGTH, decoy_bg = decoy_bg)
   sample_vj_pairs(vj_dist, chain_letter, n_pairs, step_dir, cdr3_baseline)
 
   # (1b) Carry the SAME correction into the length posterior and the PSSM.
