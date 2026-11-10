@@ -38,15 +38,15 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 1        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- "final"        # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 2         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_dana_orig_VJ" 
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
-ESM_THRESHOLDS  <- c(0.5, 0.6)
+ESM_THRESHOLDS  <- c(0.65, 0.7)
 
 N_PAIRS          <- 400    # V/J pairs sampled per chain from top-binder distribution
 N_CDR3_MULTI     <- 3      # CDR3 sequences sampled per V/J pair (enrichment steps)
@@ -92,7 +92,7 @@ TEMPLATE_MAX_TRIES <- 20   # redraws allowed when v_ext + j_ext would exceed L
 #   alpha  V+J 80.7% -> 87.8% of the CDR3 (junction 2.68 -> 1.69 residues)
 #   beta   V+J 65.9% -> 71.4%             (junction 5.08 -> 4.26 residues)
 # J moves ~2.7x as much as V on both chains, which is the intended bias.
-EXTENT_SOURCE <- "figure"
+EXTENT_SOURCE <- "survival"
 
 # --- Fixed step-0 panel ------------------------------------------------------
 # Path to a one-off generated step-0 repertoire reused for EVERY epitope, so that
@@ -116,7 +116,7 @@ DECOY_CORRECTION_VJ  <- FALSE                       # correct the V/J excess nul
 DECOY_DIR        <- "step0_background"             # holds <decoy_label>/step0 folds
 DECOY_BY_MHC     <- c(A0201 = "A0201_ALAAAAAAV")   # MHC (allele w/o HLA_ prefix) -> decoy label
 
-FINAL_PERCENTILE <- 95  # final (STEP="final") top-binder cutoff = this percentile of the POOLED
+FINAL_PERCENTILE <- 75  # final (STEP="final") top-binder cutoff = this percentile of the POOLED
                         # (alpha+beta) score distribution of the LAST step — i.e. keep the top
                         # (100 - N)% best-scoring TCRs of the final step. Epitope-adaptive.
                         # NULL = use the fixed ESM_THRESHOLDS[N_STEPS] instead.
@@ -1443,7 +1443,8 @@ run_enrich_step <- function(step, peptide, mhc_allele, label,
 run_final_validation <- function(label, peptide, mhc, mhc_allele,
                                   base_output_dir, n_steps, esm_thresholds,
                                   validation_file,
-                                  final_percentile = FINAL_PERCENTILE) {
+                                  final_percentile = FINAL_PERCENTILE,
+                                  plot_motifs = PLOT_EACH_STEP) {
   last_step_dir <- file.path(base_output_dir, label, sprintf("step%d", n_steps))
 
   # Final cutoff: either the fixed schedule value, or the Nth percentile of the
@@ -1489,6 +1490,14 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
   top_alpha <- collect_top("A")
   top_beta  <- collect_top("B")
 
+  # MixTCRviz motif plots, same as the enrichment steps do for prev_step_dir.
+  if (plot_motifs) {
+    if (!is.null(top_alpha) && nrow(top_alpha) >= 10)
+      plot_step_motif(top_alpha, "A", label, n_steps, last_step_dir)
+    if (!is.null(top_beta) && nrow(top_beta) >= 10)
+      plot_step_motif(top_beta, "B", label, n_steps, last_step_dir)
+  }
+
   model_label <- paste0(mhc, "_", peptide)
   motif_df    <- build_motif_df(top_alpha, top_beta, model_label)
 
@@ -1496,7 +1505,10 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
     warning(sprintf("[%s] No top binders found — cannot run TEMPO validation.", label))
     return(NULL)
   }
-  motif_file <- file.path(base_output_dir, label, "motif_top_binders.csv")
+  # Written INTO the scored step dir, matching run_enrich_step (which writes into
+  # prev_step_dir) and what TEMPO_score_structural_data.R / evaluate_sampled.R
+  # expect: <epitope>/<step>/motif_top_binders.csv.
+  motif_file <- file.path(last_step_dir, "motif_top_binders.csv")
   write.csv(motif_df, motif_file, row.names = FALSE)
   message(sprintf("[%s] Motif training set: %d TCRs written to %s",
                   label, nrow(motif_df), motif_file))
@@ -1506,7 +1518,7 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
     return(NULL)
   }
 
-  val_dir    <- file.path(base_output_dir, label, "validation")
+  val_dir    <- file.path(last_step_dir, "validation")
   auc_result <- validate_motif(
     motif_file      = motif_file,
     validation_file = validation_file,

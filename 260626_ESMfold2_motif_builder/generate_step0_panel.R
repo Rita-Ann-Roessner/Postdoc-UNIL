@@ -57,10 +57,13 @@ writeLines(c(sprintf("seed: %d", SEED),
              sprintf("n_alpha: %d", nrow(read.csv(file.path(OUT_DIR, "model_alpha.csv")))),
              sprintf("n_beta: %d",  nrow(read.csv(file.path(OUT_DIR, "model_beta.csv")))),
              sprintf("CDR3_TEMPLATED at creation: %s", CDR3_TEMPLATED),
+             sprintf("EXTENT_SOURCE at creation: %s", EXTENT_SOURCE),
              sprintf("JUNCTION_PSSM at creation: %s", JUNCTION_PSSM),
              "cdr3 generation: draw_random_cdr3() -> assemble_templated_cdr3()",
              "  (germline V block + junction + germline J block), the same path",
-             "  the enrichment steps use."),
+             "  the enrichment steps use.",
+             "  The V/J trimming extents come from EXTENT_SOURCE above, so a panel",
+             "  is only interchangeable with a run that carries the same setting."),
            file.path(OUT_DIR, "PANEL_INFO.txt"))
 
 message(sprintf("\nPanel written to %s/  (model_alpha.csv, model_beta.csv, PANEL_INFO.txt)", OUT_DIR))
