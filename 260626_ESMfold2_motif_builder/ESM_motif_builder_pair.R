@@ -34,6 +34,11 @@ library(pROC)
 #   STEP = 1 .. N_STEPS   → enrich from step (STEP-1) ESM scores; generate new batch
 #   STEP = c(1, 2, 3)     → run multiple enrichment steps in sequence
 #   STEP = "final"        → TEMPO validation using step N_STEPS ESM scores
+#   STEP = "pair-select"  → Module 7: pick PAIR_K bait chains per chain from the
+#                           bait step, sample PAIR_N_PREY prey from the prey step,
+#                           write both directions as one fold job
+#   STEP = "pair-validate"→ keep the top (100 - PAIR_PERCENTILE)% of all folded
+#                           pairs, build the motif and run TEMPO
 # =============================================================================
 
 ### ---- Configuration --------------------------------------------------------
@@ -121,21 +126,41 @@ FINAL_PERCENTILE <- 75  # final (STEP="final") top-binder cutoff = this percenti
                         # (100 - N)% best-scoring TCRs of the final step. Epitope-adaptive.
                         # NULL = use the fixed ESM_THRESHOLDS[N_STEPS] instead.
 
-# ---- Combinatorial chain pairing (Module 7, STEP = "pair-select" / "pair-validate") ---
-# Terminal re-scoring: fold the top alphas against the top betas as REAL pairs
-# instead of against glycine dummies. Deliberately NOT part of the enrichment
-# loop -- see the Module 7 header for why.
-PAIR_DIR         <- "pairs"   # subdirectory under <epitope>/ holding the pair fold
-PAIR_SOURCE_STEP <- NULL     # which folded step to draw the top chains from; NULL = N_STEPS
-PAIR_N_ALPHA     <- 50       # top alphas -> PAIR_N_ALPHA * PAIR_N_BETA complexes to fold
-PAIR_N_BETA      <- 50       # top betas
-PAIR_PERCENTILE  <- 99       # selection cutoff on the PAIRED score distribution; keep the top
-                             # (100 - N)% of folded pairs. Sweep it with sweep_pair_percentile.R.
-PAIR_PLOT_MOTIF  <- TRUE     # write MixTCRviz motifs for the selected pairs, as steps 0..N do
-PAIR_MOTIF_MODE  <- "paired" # "paired" = motif rows carry BOTH chains (matches validation.csv)
-                             # "chains" = split each pair into two single-chain rows, i.e. the
-                             #            shape build_motif_df produces, for a like-for-like
-                             #            comparison against the dummy-scored motif.
+# ---- Bait-and-prey chain pairing (Module 7, STEP = "pair-select" / "pair-validate") ---
+# Terminal re-scoring: a few trusted BAIT chains are folded against a broad PREY
+# pool of the other chain, as REAL pairs instead of against glycine dummies.
+# Both directions are run, so neither chain has to be declared the reliable one.
+# Deliberately NOT part of the enrichment loop -- see the Module 7 header.
+PAIR_DIR         <- "pairs"  # subdirectory under <epitope>/ holding the pair fold
+
+# Baits: top PAIR_BAIT_TOP_N of the bait step, clustered on (V, J), one bait per
+# cluster, picked under a progressively relaxed per-V / per-J cap.
+PAIR_BAIT_STEP   <- NULL     # folded step the baits come from; NULL = N_STEPS
+PAIR_K           <- 5        # baits per chain per epitope
+PAIR_BAIT_TOP_N  <- 100      # size of the pool the bait clusters are drawn from
+PAIR_BAIT_MIN_N  <- 2        # cluster must hold >= this many to count as corroborated;
+                             # singletons are allowed back in only if too few clusters pass
+
+# Prey: stratified sample of the prey step, equal coverage across the dummy-score
+# range so the dummy-vs-paired rescue curve is measurable at both ends.
+PAIR_PREY_STEP   <- 1        # folded step the prey pool comes from
+PAIR_N_PREY      <- 240      # prey per direction -> 2 * PAIR_K * PAIR_N_PREY folds
+PAIR_PREY_STRATA <- 10       # deciles of the prey step's own score distribution
+PAIR_SAMPLE_SEED <- 1        # fixes the within-stratum order; RAISING PAIR_N_PREY keeps
+                             # every chain already sampled and only adds new ones, so a
+                             # 240 -> 400 run needs 160 new folds, not 400. Changing the
+                             # SEED (or the prey step) invalidates that and reshuffles.
+
+PAIR_PERCENTILE  <- 99       # selection cutoff on the POOLED score distribution of every
+                             # folded pair, both directions together, exactly as
+                             # FINAL_PERCENTILE cuts the pooled alpha+beta distribution of
+                             # the last step. Keep the top (100 - N)% of pairs.
+                             # Sweep it with sweep_pair_percentile.R.
+PAIR_PLOT_MOTIF  <- TRUE     # write MixTCRviz motifs for the selection, as steps 0..N do
+PAIR_MOTIF_MODE  <- "paired" # "chains" = selected prey as single-chain rows, partner blanked,
+                             #            i.e. the build_motif_df shape; comparable to the steps
+                             # "paired" = the highest-scoring bait/prey pairs verbatim, both
+                             #            chains filled, matching the shape of validation.csv
 
 CHAIN_WEIGHT <- "linear" # how TEMPO combines the two chains when scoring validation:
                         # "equal"  = default TEMPO score (score_A + score_B, equal weight).
@@ -1556,18 +1581,29 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
 # plausible interface". The dummy gives the real chain nothing to pack against
 # on one side, so the docking geometry is only half-constrained.
 #
-# Here the top PAIR_N_ALPHA alphas and top PAIR_N_BETA betas from the source
-# step are folded as the full cross product of REAL alpha/beta pairs. Each
-# chain is then ranked by how it does with real partners rather than with a
-# stub, and the selected pairs can be written as a PAIRED motif, which matches
-# the shape of validation.csv instead of the union-of-single-chains that
-# build_motif_df produces.
+# Rather than crossing the top chains of both sides, which spends the budget
+# confirming what the dummy screen already believes and can never reach past the
+# top of either list, a few BAIT chains are fished against a broad PREY pool:
+#
+#   A_bait   PAIR_K bait alphas x PAIR_N_PREY prey betas    -> ranks BETA  prey
+#   B_bait   PAIR_K bait betas  x PAIR_N_PREY prey alphas   -> ranks ALPHA prey
+#
+# The allocation is the point. PAIR_K x N measures N chains with K replicates
+# instead of measuring K chains with N replicates, and replicate 20 of the same
+# chain carries almost no information while coverage is what is missing. K stays
+# above 1 so a bait that is wrong, either a scoring artifact or a genuine but
+# minority binding mode, does not condition the entire result: the spread of a
+# prey's K scores is the bait-to-bait uncertainty, which a single bait hides.
+#
+# Both directions are run, so neither chain has to be declared the reliable one.
+# Which chain is the confident one differs per epitope in practice.
 #
 # Two phases, with a cluster fold in between:
-#   STEP <- "pair-select"   build the cross product -> <ep>/pair/model_pairs.csv
-#                          (+ _seqs.csv); fold it to <ep>/pair/output_pairs.csv
-#   STEP <- "pair-validate" read the scores, rank, select at PAIR_PERCENTILE,
-#                          build the motif and run TEMPO
+#   STEP <- "pair-select"   pick baits, sample prey, build both directions ->
+#                           <ep>/pairs/model_pairs.csv (+ _seqs.csv, baits.csv,
+#                           prey.csv); fold to <ep>/pairs/output_pairs.csv
+#   STEP <- "pair-validate" cut the pooled pair scores at PAIR_PERCENTILE,
+#                           build the motif, run TEMPO
 #
 # This is NOT part of the enrichment loop, and should not become part of it.
 # Steering the sampler with paired scores closes a feedback loop between the
@@ -1578,68 +1614,217 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
 # exactly as before, so nothing upstream changes.
 # =============================================================================
 
-.pair_step <- function() if (is.null(PAIR_SOURCE_STEP)) N_STEPS else PAIR_SOURCE_STEP
+.bait_step <- function() if (is.null(PAIR_BAIT_STEP)) N_STEPS else PAIR_BAIT_STEP
 
-# ---- phase 1: build the cross product ---------------------------------------
-# Writes model_pairs.csv (annotation + provenance) and model_pairs_seqs.csv
-# (fold.py input) into <base>/<label>/<PAIR_DIR>/.
+# Scored chains of one step, highest first, or stop() with what is missing.
+.load_step_chain <- function(label, step_i, chain_letter, base_output_dir) {
+  chain_name  <- if (chain_letter == "A") "alpha" else "beta"
+  src_dir     <- file.path(base_output_dir, label, sprintf("step%d", step_i))
+  scores_file <- file.path(src_dir, sprintf("output_%s.csv", chain_name))
+  if (!file.exists(scores_file))
+    stop(sprintf("[%s] ESM scores missing: %s\nFold step %d first.",
+                 label, scores_file, step_i))
+  scored <- load_esm_scores(scores_file, meta_csv(src_dir, chain_name))
+  scored <- scored[!is.na(scored[[SCORE_COL]]), ]
+  scored[order(-scored[[SCORE_COL]]), ]
+}
+
+# Deterministic 31-bit hash of a character vector. Content-addressed, so the
+# order it induces depends only on the id and the seed, never on how many ids
+# are drawn or what order the file happens to be in. That is what makes the
+# prey sample resumable.
+.stable_hash <- function(x, seed = 1L) {
+  vapply(as.character(x), function(s) {
+    h <- (seed * 7919) %% 2147483647
+    for (ch in utf8ToInt(s)) h <- (h * 131 + ch) %% 2147483647
+    h
+  }, numeric(1), USE.NAMES = FALSE)
+}
+
+
+# ---- bait selection ---------------------------------------------------------
+# Cluster the top pool on (V, J), keep the best-scoring member of each cluster,
+# and walk the clusters in score order under a cap of `cap` baits per V gene and
+# per J gene. The cap starts at 1 and is relaxed until k baits are found, so a
+# converged chain (GIL beta on TRBV19, say) still fills, and the cap it needed
+# is recorded as a per-cell convergence measure.
+#
+# Singletons are dropped first: an uncorroborated top scorer is exactly the case
+# a single bait gets wrong. They are allowed back only if too few clusters pass.
+pair_select_baits <- function(scored, chain_letter, label,
+                              k = PAIR_K, top_n = PAIR_BAIT_TOP_N,
+                              min_n = PAIR_BAIT_MIN_N) {
+  v <- sprintf("TR%sV", chain_letter)
+  j <- sprintf("TR%sJ", chain_letter)
+  pool <- head(scored, top_n)
+  if (nrow(pool) == 0) return(NULL)
+
+  key    <- paste(pool[[v]], pool[[j]], sep = "|")
+  by_key <- split(seq_len(nrow(pool)), key)              # pool is already score-sorted
+  sizes  <- vapply(by_key, length, integer(1))
+  best   <- vapply(by_key, function(ix) ix[1], integer(1))
+
+  corroborated <- names(by_key)[sizes >= min_n]
+  relaxed      <- length(corroborated) < k
+  use          <- if (relaxed) names(by_key) else corroborated
+  use          <- use[order(-pool[[SCORE_COL]][best[use]])]
+
+  chosen <- character(0); caps <- integer(0)
+  nv <- nj <- integer(0)
+  cap <- 1L
+  while (length(chosen) < k && cap <= k) {
+    for (kk in use) {
+      if (length(chosen) >= k) break
+      if (kk %in% chosen) next
+      vv <- pool[[v]][best[kk]]; jj <- pool[[j]][best[kk]]
+      if (isTRUE(nv[vv] >= cap) || isTRUE(nj[jj] >= cap)) next
+      chosen <- c(chosen, kk); caps <- c(caps, cap)
+      nv[vv] <- if (is.na(nv[vv])) 1L else nv[vv] + 1L
+      nj[jj] <- if (is.na(nj[jj])) 1L else nj[jj] + 1L
+    }
+    cap <- cap + 1L
+  }
+  if (length(chosen) == 0) return(NULL)
+
+  baits <- pool[best[chosen], , drop = FALSE]
+  baits$bait_cluster <- sub("\\|", "/", chosen)
+  baits$cluster_n    <- as.integer(sizes[chosen])
+  baits$admitted_cap <- caps
+
+  message(sprintf("  [bait %s] %d clusters in top %d, %d corroborated -> %d baits%s",
+                  chain_letter, length(by_key), nrow(pool), length(corroborated),
+                  nrow(baits),
+                  if (relaxed) "  [singletons allowed: too few corroborated]" else ""))
+  for (i in seq_len(nrow(baits)))
+    message(sprintf("    %-22s n=%-3d score=%.3f  cap %d",
+                    baits$bait_cluster[i], baits$cluster_n[i],
+                    baits[[SCORE_COL]][i], baits$admitted_cap[i]))
+  baits
+}
+
+
+# ---- prey sampling ----------------------------------------------------------
+# Equal coverage across the dummy-score range: cut the pool into `strata`
+# quantile bins, order each bin by .stable_hash, then take round-robin across
+# bins until n are drawn.
+#
+# Round-robin is what makes this resumable. Raising n only ever appends: the
+# first n chains of an n = 400 draw are exactly the n = 240 draw, so the extra
+# 160 are the only new folds. Short strata self-balance, because a bin that runs
+# out is simply skipped on later passes.
+pair_sample_prey <- function(scored, label, chain_letter,
+                             n = PAIR_N_PREY, strata = PAIR_PREY_STRATA,
+                             seed = PAIR_SAMPLE_SEED) {
+  if (nrow(scored) == 0) return(NULL)
+  n <- min(n, nrow(scored))
+
+  sc    <- scored[[SCORE_COL]]
+  brk   <- unique(quantile(sc, seq(0, 1, length.out = strata + 1), na.rm = TRUE))
+  bin   <- if (length(brk) < 3) rep(1L, length(sc))
+           else as.integer(cut(sc, breaks = brk, include.lowest = TRUE))
+  ord   <- order(.stable_hash(scored$id, seed))
+  by_bin <- split(ord, bin[ord])                 # each bin already in hash order
+
+  picked <- integer(0); pass <- 1L
+  while (length(picked) < n) {
+    added <- FALSE
+    for (b in names(by_bin)) {
+      if (length(picked) >= n) break
+      ix <- by_bin[[b]]
+      if (pass <= length(ix)) { picked <- c(picked, ix[pass]); added <- TRUE }
+    }
+    if (!added) break
+    pass <- pass + 1L
+  }
+
+  prey <- scored[picked, , drop = FALSE]
+  prey$prey_stratum <- bin[picked]
+  tab <- table(factor(prey$prey_stratum, levels = seq_len(max(bin))))
+  message(sprintf("  [prey %s] %d of %d sampled across %d strata (%s), score %.3f-%.3f",
+                  chain_letter, nrow(prey), nrow(scored), length(by_bin),
+                  paste(as.integer(tab), collapse = "/"),
+                  min(prey[[SCORE_COL]]), max(prey[[SCORE_COL]])))
+  prey
+}
+
+
+# ---- phase 1: build the bait x prey folds -----------------------------------
+# Writes model_pairs.csv (annotation + provenance), model_pairs_seqs.csv
+# (fold.py input), baits.csv and prey.csv into <base>/<label>/<PAIR_DIR>/.
+#
+# Both directions go into one file, tagged by `direction`, so the whole epitope
+# is a single cluster job:
+#   A_bait  bait alphas x prey betas   -> ranks BETA  chains
+#   B_bait  bait betas  x prey alphas  -> ranks ALPHA chains
 run_pair_select <- function(peptide, mhc_allele, label, species = "HomoSapiens",
-                              base_output_dir = BASE_OUTPUT_DIR,
-                              n_alpha = PAIR_N_ALPHA, n_beta = PAIR_N_BETA) {
-  step_i  <- .pair_step()
-  src_dir <- file.path(base_output_dir, label, sprintf("step%d", step_i))
+                            base_output_dir = BASE_OUTPUT_DIR,
+                            k = PAIR_K, n_prey = PAIR_N_PREY) {
+  bait_i  <- .bait_step()
+  prey_i  <- PAIR_PREY_STEP
   out_dir <- file.path(base_output_dir, label, PAIR_DIR)
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-  top_n <- function(chain_letter, n) {
-    chain_name  <- if (chain_letter == "A") "alpha" else "beta"
-    scores_file <- file.path(src_dir, sprintf("output_%s.csv", chain_name))
-    if (!file.exists(scores_file))
-      stop(sprintf("[%s] ESM scores missing: %s\nFold step %d first.",
-                   label, scores_file, step_i))
-    scored <- load_esm_scores(scores_file, meta_csv(src_dir, chain_name))
-    scored <- scored[!is.na(scored[[SCORE_COL]]), ]
-    scored <- scored[order(-scored[[SCORE_COL]]), ]
-    if (nrow(scored) < n)
-      warning(sprintf("[%s] chain %s has only %d scored TCRs (< %d requested).",
-                      label, chain_letter, nrow(scored), n))
-    head(scored, n)
-  }
+  message(sprintf("\n[%s] Pair select: baits from step%d, prey from step%d",
+                  label, bait_i, prey_i))
 
-  A <- top_n("A", n_alpha)
-  B <- top_n("B", n_beta)
-  if (nrow(A) == 0 || nrow(B) == 0) {
-    warning(sprintf("[%s] no scored TCRs on one chain - pairing skipped.", label))
+  baits <- prey <- list()
+  for (ch in c("A", "B")) {
+    baits[[ch]] <- pair_select_baits(.load_step_chain(label, bait_i, ch, base_output_dir),
+                                     ch, label, k = k)
+    prey[[ch]]  <- pair_sample_prey(.load_step_chain(label, prey_i, ch, base_output_dir),
+                                    label, ch, n = n_prey)
+  }
+  if (any(vapply(c(baits, prey), is.null, logical(1)))) {
+    warning(sprintf("[%s] bait or prey selection empty - pairing skipped.", label))
     return(invisible(NULL))
   }
 
-  idx <- expand.grid(ia = seq_len(nrow(A)), ib = seq_len(nrow(B)))
-  pairs <- data.frame(
-    id         = sprintf("pair%05d", seq_len(nrow(idx))),
-    alpha_id   = A$id[idx$ia],
-    beta_id    = B$id[idx$ib],
-    alpha_solo = A[[SCORE_COL]][idx$ia],   # the dummy-partner score, for comparison
-    beta_solo  = B[[SCORE_COL]][idx$ib],
-    TRAV       = A$TRAV[idx$ia],
-    TRAJ       = A$TRAJ[idx$ia],
-    cdr3_TRA   = A$cdr3_TRA[idx$ia],
-    TRBV       = B$TRBV[idx$ib],
-    TRBJ       = B$TRBJ[idx$ib],
-    cdr3_TRB   = B$cdr3_TRB[idx$ib],
-    stringsAsFactors = FALSE)
+  # One direction: bait chain `bc` against prey of the other chain.
+  cross <- function(bc) {
+    pc <- if (bc == "A") "B" else "A"
+    bt <- baits[[bc]]; py <- prey[[pc]]
+    ix <- expand.grid(ib = seq_len(nrow(bt)), ip = seq_len(nrow(py)))
+    d  <- data.frame(
+      direction    = sprintf("%s_bait", bc),
+      bait_chain   = bc,
+      prey_chain   = pc,
+      bait_id      = bt$id[ix$ib],
+      prey_id      = py$id[ix$ip],
+      bait_cluster = bt$bait_cluster[ix$ib],
+      bait_solo    = bt[[SCORE_COL]][ix$ib],   # dummy-partner scores, for comparison
+      prey_solo    = py[[SCORE_COL]][ix$ip],
+      prey_stratum = py$prey_stratum[ix$ip],
+      stringsAsFactors = FALSE)
+    for (cc in c("V", "J")) {
+      d[[paste0("TR", bc, cc)]] <- bt[[paste0("TR", bc, cc)]][ix$ib]
+      d[[paste0("TR", pc, cc)]] <- py[[paste0("TR", pc, cc)]][ix$ip]
+    }
+    d[[paste0("cdr3_TR", bc)]] <- bt[[paste0("cdr3_TR", bc)]][ix$ib]
+    d[[paste0("cdr3_TR", pc)]] <- py[[paste0("cdr3_TR", pc)]][ix$ip]
+    d
+  }
+
+  cols  <- c("direction", "bait_chain", "prey_chain", "bait_id", "prey_id",
+             "bait_cluster", "bait_solo", "prey_solo", "prey_stratum",
+             "TRAV", "TRAJ", "cdr3_TRA", "TRBV", "TRBJ", "cdr3_TRB")
+  pairs <- rbind(cross("A")[, cols], cross("B")[, cols])
+  pairs <- cbind(id = sprintf("pair%05d", seq_len(nrow(pairs))), pairs)
   pairs$peptide <- peptide
   pairs$MHC     <- mhc_allele
   pairs$species <- species
 
-  model_file <- file.path(out_dir, "model_pairs.csv")
-  write.csv(pairs, model_file, row.names = FALSE)
+  write.csv(pairs, file.path(out_dir, "model_pairs.csv"), row.names = FALSE)
   write_fold_input_csv(pairs, file.path(out_dir, "model_pairs_seqs.csv"))
+  write.csv(do.call(rbind, lapply(names(baits), function(ch)
+              cbind(chain = ch, baits[[ch]]))),
+            file.path(out_dir, "baits.csv"), row.names = FALSE)
+  write.csv(do.call(rbind, lapply(names(prey), function(ch)
+              cbind(chain = ch, prey[[ch]]))),
+            file.path(out_dir, "prey.csv"), row.names = FALSE)
 
-  message(sprintf("[%s] Pairing: %d alpha x %d beta = %d complexes -> %s",
-                  label, nrow(A), nrow(B), nrow(pairs), out_dir))
-  message(sprintf("  source step%d  |  alpha solo %.3f-%.3f  beta solo %.3f-%.3f",
-                  step_i, min(A[[SCORE_COL]]), max(A[[SCORE_COL]]),
-                  min(B[[SCORE_COL]]), max(B[[SCORE_COL]])))
+  message(sprintf("  A_bait: %d baits x %d prey betas  |  B_bait: %d baits x %d prey alphas",
+                  nrow(baits$A), nrow(prey$B), nrow(baits$B), nrow(prey$A)))
+  message(sprintf("  %d complexes -> %s", nrow(pairs), out_dir))
   message(sprintf("  Now fold %s on the cluster, then rerun with STEP <- \"pair-validate\".",
                   file.path(out_dir, "model_pairs_seqs.csv")))
   invisible(pairs)
@@ -1669,104 +1854,149 @@ load_pair_scores <- function(label, base_output_dir = BASE_OUTPUT_DIR) {
   scored
 }
 
-# Compatibility matrix, per-chain rankings, and two questions worth asking of
-# the matrix before trusting any of it. Writes pair_matrix.csv / rank_*.csv.
+# Per-direction diagnostics. These describe the folded matrix, not the
+# selection, so they are computed once and reused across cut-offs.
+# Writes pair_matrix_<dir>.csv and prey_scores.csv.
 pair_diagnostics <- function(scored, label, base_output_dir = BASE_OUTPUT_DIR,
                              write_files = TRUE) {
   out_dir <- file.path(base_output_dir, label, PAIR_DIR)
-  sc <- scored[[SCORE_COL]]
+  message(sprintf("\n[%s] Pairing: %d folded bait/prey complexes", label, nrow(scored)))
+  res <- list(); prey_rows <- list()
 
-  a_mean <- tapply(sc, scored$alpha_id, mean)
-  b_mean <- tapply(sc, scored$beta_id,  mean)
+  for (dir_i in unique(scored$direction)) {
+    d  <- scored[scored$direction == dir_i, , drop = FALSE]
+    sc <- d[[SCORE_COL]]
+    m  <- tapply(sc, list(d$bait_id, d$prey_id), mean)
+    if (write_files)
+      write.csv(m, file.path(out_dir, sprintf("pair_matrix_%s.csv", dir_i)))
 
-  if (write_files) {
-    write.csv(tapply(sc, list(scored$alpha_id, scored$beta_id), mean),
-              file.path(out_dir, "pair_matrix.csv"))
-    write.csv(data.frame(alpha_id = names(a_mean), mean_paired = as.numeric(a_mean)),
-              file.path(out_dir, "rank_alpha.csv"), row.names = FALSE)
-    write.csv(data.frame(beta_id = names(b_mean), mean_paired = as.numeric(b_mean)),
-              file.path(out_dir, "rank_beta.csv"), row.names = FALSE)
+    # one row per prey: what its PAIR_K baits said about it
+    g   <- function(f, col = SCORE_COL) tapply(d[[col]], d$prey_id, f)
+    ids <- names(g(length))
+    prey_rows[[dir_i]] <- data.frame(
+      direction  = dir_i, prey_chain = d$prey_chain[1], prey_id = ids,
+      n_baits    = as.integer(g(length)[ids]),
+      mean_score = as.numeric(g(mean)[ids]),
+      max_score  = as.numeric(g(max)[ids]),
+      sd_score   = as.numeric(g(function(x) if (length(x) < 2) NA_real_ else sd(x))[ids]),
+      prey_solo  = as.numeric(g(function(x) x[1], "prey_solo")[ids]),
+      prey_stratum = as.integer(g(function(x) x[1], "prey_stratum")[ids]),
+      stringsAsFactors = FALSE)
+    rk <- prey_rows[[dir_i]]
+
+    # Additive (no-interaction) model: score ~ bait effect + prey effect.
+    # R^2 near 1 means a prey is simply good or bad with every bait, so the
+    # pairing only re-ranks. Lower R^2 means real compatibility structure.
+    r2 <- tryCatch(summary(lm(sc ~ factor(d$bait_id) + factor(d$prey_id)))$r.squared,
+                   error = function(e) NA_real_)
+
+    # Do the baits agree about the prey? Mean pairwise Spearman across the bait
+    # rows. Near 1 = one binding mode. Low = the baits rank different things,
+    # and a prey's single pooled score hides which bait it came from.
+    rhos <- c()
+    if (ncol(m) > 1 && nrow(m) > 1)
+      for (i in seq_len(nrow(m) - 1)) for (j in (i + 1):nrow(m))
+        rhos <- c(rhos, suppressWarnings(cor(m[i, ], m[j, ], method = "spearman",
+                                             use = "pairwise.complete.obs")))
+    concord <- if (length(rhos)) mean(rhos, na.rm = TRUE) else NA_real_
+
+    # Does the paired ranking agree with the dummy ranking the prey came with?
+    rho <- suppressWarnings(cor(rk$mean_score, rk$prey_solo, method = "spearman"))
+
+    message(sprintf("  %-7s %d baits x %d prey (%s)  score mean %.3f  range %.3f-%.3f",
+                    dir_i, nrow(m), ncol(m), d$prey_chain[1], mean(sc), min(sc), max(sc)))
+    message(sprintf("           additive R^2 = %s   bait concordance = %s   rho(paired, dummy) = %s",
+                    if (is.na(r2)) "NA" else sprintf("%.3f", r2),
+                    if (is.na(concord)) "NA" else sprintf("%.3f", concord),
+                    if (is.na(rho)) "NA" else sprintf("%.3f", rho)))
+    message(sprintf("           median bait-to-bait sd of a prey: %.3f",
+                    median(rk$sd_score, na.rm = TRUE)))
+
+    # Rescue curve: where in the dummy-score range the paired winners come from.
+    top <- rk[rk$mean_score >= quantile(rk$mean_score, 0.9, na.rm = TRUE), ]
+    message(sprintf("           top-decile prey by dummy stratum: %s",
+                    paste(as.integer(table(factor(top$prey_stratum,
+                          levels = seq_len(PAIR_PREY_STRATA)))), collapse = "/")))
+
+    res[[dir_i]] <- list(r2 = r2, concordance = concord, rho_dummy = rho,
+                         median_sd = median(rk$sd_score, na.rm = TRUE))
   }
-
-  # Additive (no-interaction) model: score ~ alpha effect + beta effect.
-  # R^2 near 1 means a chain is simply good or bad with every partner, so the
-  # pairing only re-ranks. Lower R^2 means real compatibility structure.
-  r2 <- tryCatch({
-    summary(lm(sc ~ factor(scored$alpha_id) + factor(scored$beta_id)))$r.squared
-  }, error = function(e) NA_real_)
-
-  # Does the paired ranking agree with the dummy ranking it came from? Near 1
-  # means the dummy was already measuring the right thing.
-  rho_a <- suppressWarnings(cor(a_mean,
-             tapply(scored$alpha_solo, scored$alpha_id, mean), method = "spearman"))
-  rho_b <- suppressWarnings(cor(b_mean,
-             tapply(scored$beta_solo,  scored$beta_id,  mean), method = "spearman"))
-
-  message(sprintf("\n[%s] Pairing: %d folded pairs (%d alpha x %d beta)",
-                  label, nrow(scored), length(a_mean), length(b_mean)))
-  message(sprintf("  paired score  mean %.3f  range %.3f-%.3f", mean(sc), min(sc), max(sc)))
-  message(sprintf("  additive R^2 = %s   (1 = no pairing structure, chains just good/bad)",
-                  if (is.na(r2)) "NA" else sprintf("%.3f", r2)))
-  message(sprintf("  Spearman paired vs dummy ranking:  alpha %.3f   beta %.3f", rho_a, rho_b))
-
-  list(r2 = r2, rho_alpha = rho_a, rho_beta = rho_b)
+  if (write_files)
+    write.csv(do.call(rbind, prey_rows), file.path(out_dir, "prey_scores.csv"),
+              row.names = FALSE)
+  res
 }
 
-# MixTCRviz motif for the selected pairs. The counterpart of plot_step_motif,
-# except that both chains are real here, so one call covers the pair: no
-# per-chain split, since the paired rows are what the motif file holds and what
-# TEMPO is trained on.
-plot_pair_motif <- function(top, label, percentile, out_dir) {
-  cols <- c("TRAV", "TRAJ", "cdr3_TRA", "TRBV", "TRBJ", "cdr3_TRB")
-  df   <- unique(top[, cols, drop = FALSE])
-
-  if (nrow(df) < 10) {
-    message(sprintf("  Motif skipped (n=%d < 10)", nrow(df)))
-    return(invisible(NULL))
+# MixTCRviz motif for the selection. In "chains" mode the prey of each direction
+# are plotted separately, since they are single chains with the partner blanked
+# and that is the like-for-like comparison against the step motifs. In "paired"
+# mode one call covers the intact pairs.
+plot_pair_motif <- function(motif_df, label, percentile, out_dir, motif_mode) {
+  draw <- function(df, name, extra) {
+    df <- unique(df)
+    if (nrow(df) < 10) {
+      message(sprintf("  Motif %s skipped (n=%d < 10)", name, nrow(df)))
+      return(invisible(NULL))
+    }
+    message(sprintf("  Plotting motif (p%g, %s, n=%d)", percentile, name, nrow(df)))
+    tryCatch(
+      MixTCRviz(
+        input1      = df,
+        output.path = file.path(out_dir, sprintf("motif_%s", name)),
+        plot        = TRUE,
+        renormVJ    = TRUE,
+        set.title   = sprintf("%s - %s p%g (n=%d)", label, extra, percentile, nrow(df)),
+        verbose     = 0
+      ),
+      error = function(e) warning(sprintf("[%s | p%g] motif %s failed: %s",
+                                          label, percentile, name, conditionMessage(e))))
   }
-  message(sprintf("  Plotting motif (p%g, pairs, n=%d)", percentile, nrow(df)))
-  tryCatch(
-    MixTCRviz(
-      input1      = df,
-      output.path = file.path(out_dir, "motif_pairs"),
-      plot        = TRUE,
-      renormVJ    = TRUE,
-      set.title   = sprintf("%s - pairs p%g top binders (n=%d)",
-                            label, percentile, nrow(df)),
-      verbose     = 0
-    ),
-    error = function(e) warning(sprintf("[%s | p%g] motif failed: %s",
-                                        label, percentile, conditionMessage(e))))
+  cols <- c("TRAV", "TRAJ", "cdr3_TRA", "TRBV", "TRBJ", "cdr3_TRB")
+  if (identical(motif_mode, "paired")) {
+    draw(motif_df[, cols, drop = FALSE], "pairs", "selected pairs")
+  } else {
+    a <- motif_df[!is.na(motif_df$cdr3_TRA), cols, drop = FALSE]
+    b <- motif_df[!is.na(motif_df$cdr3_TRB), cols, drop = FALSE]
+    draw(a, "alpha", "selected alpha prey")
+    draw(b, "beta",  "selected beta prey")
+  }
 }
 
 
 # Select at ONE percentile, build the motif, run TEMPO. Returns a one-row
 # data.frame. out_dir is where everything for this cut-off is written.
+#
+# The cut-off is a percentile of the POOLED score distribution over every folded
+# pair, both directions together, exactly as STEP = "final" cuts the pooled
+# alpha+beta distribution of the last step. Keep the top (100 - percentile)%.
 pair_validate_at <- function(scored, percentile, out_dir, label, peptide, mhc,
                            motif_mode = PAIR_MOTIF_MODE, validation_file = NULL,
                            diag = NULL, plot_motif = PAIR_PLOT_MOTIF) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   sc  <- scored[[SCORE_COL]]
   thr <- as.numeric(quantile(sc, percentile / 100, na.rm = TRUE))
-  top <- scored[sc >= thr, ]
+  top <- scored[sc >= thr, , drop = FALSE]
   write.csv(top, file.path(out_dir, "top_pairs.csv"), row.names = FALSE)
   write_fold_input_csv(top, file.path(out_dir, "top_pairs_seqs.csv"))
 
-  if (isTRUE(plot_motif)) plot_pair_motif(top, label, percentile, out_dir)
-
   cols <- c("TRAV", "TRAJ", "cdr3_TRA", "TRBV", "TRBJ", "cdr3_TRB")
-  if (identical(motif_mode, "chains")) {
-    # same shape build_motif_df produces: one row per chain, partner blanked
+  if (identical(motif_mode, "paired")) {
+    motif_df <- unique(top[, cols, drop = FALSE])
+  } else {
+    # every chain appearing in a surviving pair, partner blanked: the shape
+    # build_motif_df produces. Bait chains collapse to PAIR_K rows under unique().
     da <- top[, cols, drop = FALSE]; da$TRBV <- da$TRBJ <- da$cdr3_TRB <- NA_character_
     db <- top[, cols, drop = FALSE]; db$TRAV <- db$TRAJ <- db$cdr3_TRA <- NA_character_
     motif_df <- unique(rbind(da, db))
-  } else {
-    motif_df <- unique(top[, cols, drop = FALSE])
   }
   motif_df$model <- paste0(mhc, "_", peptide)
 
+  n_a   <- sum(!is.na(motif_df$cdr3_TRA)); n_b <- sum(!is.na(motif_df$cdr3_TRB))
+  n_dir <- table(factor(top$direction, levels = c("A_bait", "B_bait")))
+
   motif_file <- file.path(out_dir, "motif_top_binders.csv")
   write.csv(motif_df, motif_file, row.names = FALSE)
+  if (isTRUE(plot_motif)) plot_pair_motif(motif_df, label, percentile, out_dir, motif_mode)
 
   auc <- auc01 <- NA_real_
   have_val <- isTRUE(VALIDATION_AVAILABLE) && !is.null(validation_file) &&
@@ -1783,25 +2013,35 @@ pair_validate_at <- function(scored, percentile, out_dir, label, peptide, mhc,
     message("  no validation.csv - motif written, AUC left NA.")
   }
 
-  message(sprintf("  p%-4g thr=%.4f  pairs=%-5d uniq_alpha=%-4d uniq_beta=%-4d motif=%-5d AUC=%s",
-                  percentile, thr, nrow(top),
-                  length(unique(top$alpha_id)), length(unique(top$beta_id)), nrow(motif_df),
+  message(sprintf("  p%-4g thr=%.4f  pairs=%-5d (A_bait %d / B_bait %d)  alpha=%-4d beta=%-4d  motif=%-5d AUC=%s",
+                  percentile, thr, nrow(top), n_dir[["A_bait"]], n_dir[["B_bait"]],
+                  n_a, n_b, nrow(motif_df),
                   if (is.na(auc)) "NA" else sprintf("%.4f", auc)))
 
+  d <- function(dir_i, field)
+    if (is.null(diag) || is.null(diag[[dir_i]])) NA_real_ else round(diag[[dir_i]][[field]], 3)
+
   data.frame(
-    epitope = label, source_step = .pair_step(), percentile = percentile,
-    threshold = round(thr, 4), n_pairs = nrow(top),
-    uniq_alpha = length(unique(top$alpha_id)),
-    uniq_beta  = length(unique(top$beta_id)),
+    epitope = label, bait_step = .bait_step(), prey_step = PAIR_PREY_STEP,
+    k = PAIR_K, n_prey = PAIR_N_PREY,
+    percentile = percentile, threshold = round(thr, 4),
+    n_pairs = nrow(top),
+    n_A_bait = as.integer(n_dir[["A_bait"]]), n_B_bait = as.integer(n_dir[["B_bait"]]),
+    n_alpha = n_a, n_beta = n_b,
     n_motif = nrow(motif_df), motif_mode = motif_mode,
-    additive_r2 = if (is.null(diag)) NA_real_ else round(diag$r2, 4),
-    rho_alpha   = if (is.null(diag)) NA_real_ else round(diag$rho_alpha, 3),
-    rho_beta    = if (is.null(diag)) NA_real_ else round(diag$rho_beta, 3),
+    # A_bait fishes BETA prey, B_bait fishes ALPHA prey
+    r2_beta_prey    = d("A_bait", "r2"),   r2_alpha_prey    = d("B_bait", "r2"),
+    concord_beta    = d("A_bait", "concordance"),
+    concord_alpha   = d("B_bait", "concordance"),
+    rho_dummy_beta  = d("A_bait", "rho_dummy"),
+    rho_dummy_alpha = d("B_bait", "rho_dummy"),
+    sd_beta         = d("A_bait", "median_sd"),
+    sd_alpha        = d("B_bait", "median_sd"),
     auc = auc, auc01 = auc01, stringsAsFactors = FALSE)
 }
 
 
-# ---- phase 2: rank, select at PAIR_PERCENTILE, validate ---------------------
+# ---- phase 2: select at PAIR_PERCENTILE, validate ---------------------------
 # Expects <base>/<label>/<PAIR_DIR>/output_pairs.csv next to model_pairs.csv.
 # Writes the selection straight into <PAIR_DIR>/. To compare cut-offs, use
 # sweep_pair_percentile.R instead, which writes into <PAIR_DIR>/p<NN>/.
@@ -1952,11 +2192,14 @@ if (identical(STEP, "pair-validate") && length(pair_summary) > 0) {
   pair_df <- pair_df[order(pair_df$epitope), ]
   out <- file.path(BASE_OUTPUT_DIR, "pair_summary.csv")
   write.csv(pair_df, out, row.names = FALSE)
-  message("\n===== Chain pairing =====")
+  message("\n===== Bait/prey pairing =====")
   print(pair_df[, c("epitope", "percentile", "threshold", "n_pairs",
-                    "uniq_alpha", "uniq_beta", "n_motif",
-                    "additive_r2", "rho_alpha", "rho_beta", "auc", "auc01")],
-        row.names = FALSE)
+                    "n_A_bait", "n_B_bait", "n_alpha", "n_beta",
+                    "n_motif", "auc", "auc01")], row.names = FALSE)
+  message("\n  diagnostics (per fished chain):")
+  print(pair_df[, c("epitope", "r2_alpha_prey", "concord_alpha", "rho_dummy_alpha",
+                    "sd_alpha", "r2_beta_prey", "concord_beta", "rho_dummy_beta",
+                    "sd_beta")], row.names = FALSE)
   message(sprintf("\n  Saved to: %s", out))
 }
 

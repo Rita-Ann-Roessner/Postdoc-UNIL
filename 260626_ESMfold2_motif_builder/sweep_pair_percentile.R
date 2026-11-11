@@ -1,19 +1,27 @@
 # =============================================================================
 # PAIR_PERCENTILE sweep
 #
-# Sweeps the selection cut-off applied to an ALREADY FOLDED chain-pairing run
-# (ESM_motif_builder_fishing.R, STEP <- "pair-select" then the cluster fold).
+# Sweeps the selection cut-off applied to an ALREADY FOLDED bait/prey run
+# (ESM_motif_builder_pair.R, STEP <- "pair-select" then the cluster fold).
 # Nothing is refolded: each cut-off re-selects from the same output_pairs.csv,
 # builds its motif and runs TEMPO.
 #
+# The cut-off is a percentile of the POOLED score distribution over every folded
+# pair, both directions together, exactly as FINAL_PERCENTILE cuts the pooled
+# alpha+beta distribution of the last step.
+#
 # Output per cut-off:
-#     <BASE>/<epitope>/pair/p<NN>/
+#     <BASE>/<epitope>/pairs/p<NN>/
 # holding top_pairs.csv, motif_top_binders.csv and validation/. The combined
 # table goes to
 #     <BASE>/pair_percentile_sweep.csv
+# and carries the per-direction diagnostics (additive R^2, bait concordance,
+# rho against the dummy ranking, median per-prey sd) alongside the AUCs. Those
+# describe the folded matrix rather than the cut-off, so they are computed once
+# per epitope and repeat down that epitope's rows.
 #
-# This leaves the fixed-percentile run that ESM_motif_builder_fishing.R writes
-# straight into <BASE>/<epitope>/pair/ untouched, so the two never collide.
+# This leaves the fixed-percentile run that ESM_motif_builder_pair.R writes
+# straight into <BASE>/<epitope>/pairs/ untouched, so the two never collide.
 #
 # Set the config block below.
 #
@@ -26,8 +34,8 @@ source("ESM_motif_builder_pair.R")   # helpers + config; main block skipped
 # ---- config -----------------------------------------------------------------
 PERCENTILES <- c(50, 75, 90, 95, 99)
 MOTIF_MODE  <- PAIR_MOTIF_MODE   # "paired" or "chains"; see ESM_motif_builder_pair.R
-PLOT_MOTIF  <- FALSE             # MixTCRviz motifs per cut-off; 3 per cut-off, so off by
-                                 # default here. The fixed-percentile run still writes them.
+PLOT_MOTIF  <- FALSE             # MixTCRviz motifs per cut-off, off by default here.
+                                 # The fixed-percentile run still writes them.
 
 SUMMARY_CSV <- file.path(BASE_OUTPUT_DIR, "pair_percentile_sweep.csv")
 
@@ -43,7 +51,7 @@ for (label in epitopes) {
                                             conditionMessage(e))); NULL })
   if (is.null(scored)) next
 
-  # matrix + rankings + the two structure diagnostics, computed once per epitope
+  # matrices + per-prey scores + structure diagnostics, computed once per epitope
   diag <- pair_diagnostics(scored, label, BASE_OUTPUT_DIR)
 
   validation_file <- file.path(BASE_OUTPUT_DIR, label, "validation.csv")
@@ -71,7 +79,13 @@ write.csv(summary_df, SUMMARY_CSV, row.names = FALSE)
 
 message("\n===== PAIR_PERCENTILE sweep =====")
 print(summary_df[, c("epitope", "percentile", "threshold", "n_pairs",
-                     "uniq_alpha", "uniq_beta", "n_motif", "auc", "auc01")],
+                     "n_A_bait", "n_B_bait", "n_alpha", "n_beta",
+                     "n_motif", "auc", "auc01")], row.names = FALSE)
+
+message("\n  diagnostics (per fished chain; constant across cut-offs):")
+print(unique(summary_df[, c("epitope", "r2_alpha_prey", "concord_alpha",
+                            "rho_dummy_alpha", "sd_alpha", "r2_beta_prey",
+                            "concord_beta", "rho_dummy_beta", "sd_beta")]),
       row.names = FALSE)
 
 if (any(!is.na(summary_df$auc))) {
@@ -80,9 +94,9 @@ if (any(!is.na(summary_df$auc))) {
     d <- summary_df[summary_df$epitope == ep & !is.na(summary_df$auc), ]
     if (nrow(d) == 0) next
     b <- d[which.max(d$auc), ]
-    message(sprintf("  %-18s p%-4g AUC=%.4f  AUC01=%.4f  (%d pairs, %d alpha, %d beta)",
+    message(sprintf("  %-18s p%-4g AUC=%.4f  AUC01=%.4f  (%d alpha, %d beta)",
                     b$epitope, b$percentile, b$auc, b$auc01,
-                    b$n_pairs, b$uniq_alpha, b$uniq_beta))
+                    b$n_alpha, b$n_beta))
   }
 }
 
