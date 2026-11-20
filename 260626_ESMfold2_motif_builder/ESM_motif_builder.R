@@ -38,11 +38,11 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- "final"        # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 0         # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 2         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles" 
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_NY-ESO-1_fix" 
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
@@ -131,13 +131,14 @@ CHAIN_WEIGHT <- "linear" # how TEMPO combines the two chains when scoring valida
 PLOT_EACH_STEP     <- TRUE   # if TRUE, plot MixTCRviz motif after each enrichment step
 VALIDATE_EACH_STEP <- TRUE  # if TRUE, run TEMPO validation after each enrichment step
 
-VALIDATION_AVAILABLE <- TRUE  # set FALSE when this epitope has NO validation data — skips ALL
+VALIDATION_AVAILABLE <- FALSE  # set FALSE when this epitope has NO validation data — skips ALL
                               # TEMPO validation (per-step AND final); motifs are still built and
                               # written. Manual flag on purpose (not auto file-detection), so a
                               # misplaced validation.csv can't silently pass unnoticed.
 
 EPITOPES_FILE <- NULL #"epitopes.txt"   # one "MHC_PEPTIDE" label per line, e.g. "A0201_ELAGIGILTV"
-epitopes <- c("A0201_ELAGIGILTV", "A0201_GILGFVFTL", "A0201_LLWNGPMAV")
+#epitopes <- c("A0201_ELAGIGILTV", "A0201_GILGFVFTL", "A0201_LLWNGPMAV")
+epitopes <- c("A0201_SLLMWITQC")
 
 if (!is.null(EPITOPES_FILE) && file.exists(EPITOPES_FILE)) {
   epitopes <- trimws(readLines(EPITOPES_FILE))
@@ -345,11 +346,24 @@ draw_random_cdr3 <- function(chain, v_seg, j_seg, cdr3_baseline) {
 }
 
 
+# Which reference rows count as functional. IMGT writes "(F)" -- functional, with a
+# caveat -- and a GENE-level row inherits the annotation of its default_allele. For
+# TRBV12-4 the default is *02, annotated "(F)", while *01 is plain "F". A strict
+# == "F" test therefore dropped TRBV12-4 outright, and it is the ONLY gene across
+# TRAV/TRAJ/TRBV/TRBJ carrying "(F)", so this silently removed one real gene:
+# 2.2% of the TRB baseline repertoire, with a full 13-key CDR3 baseline and a
+# usable germline sequence. It was never sampled at step 0 nor in any enrichment
+# step. ORF and P stay excluded, as before.
+#
+# Used by BOTH gene-filtering sites (step-0 generation and the enrichment priors);
+# keep it that way so the two cannot drift apart again.
+.is_functional <- function(gene_type) gene_type %in% c("F", "(F)")
+
 generate_vj_pairs <- function(chain, input_dir, output_dir) {
   genes <- c(paste0("TR", chain, "V"), paste0("TR", chain, "J"))
   lst <- lapply(genes, function(gene) {
     df <- read.csv(file.path(input_dir, paste0(gene, ".csv")))
-    df[df$gene_type == "F", 1]
+    df[.is_functional(df$gene_type), 1]
   })
   pairs           <- expand.grid(lst[[1]], lst[[2]])
   colnames(pairs) <- genes
@@ -839,14 +853,14 @@ meta_csv <- function(step_dir, chain_name) {
 # Module 5 — Enrichment helpers (per-chain)
 # =============================================================================
 
-# Functional (gene_type == "F") gene names per gene, from the same reference
-# tables step 0 uses. Non-functional genes (pseudogenes / ORF / orphons) are
-# present in the baseline but must never enter the enrichment steps.
+# Functional gene names per gene (gene_type "F" or "(F)", see .is_functional),
+# from the same reference tables step 0 uses. Non-functional genes (pseudogenes /
+# ORF / orphons) are present in the baseline but must never enter the enrichment steps.
 load_functional_genes <- function(input_dir) {
   genes <- c("TRAV", "TRAJ", "TRBV", "TRBJ")
   setNames(lapply(genes, function(g) {
     df <- read.csv(file.path(input_dir, paste0(g, ".csv")))
-    df[df$gene_type == "F", 1]
+    df[.is_functional(df$gene_type), 1]   # see .is_functional: includes "(F)"
   }), genes)
 }
 
@@ -1537,7 +1551,7 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
 
 baseline         <- MixTCRviz::baseline_HomoSapiens
 cdr3_baseline    <- baseline$countCDR3.VJL
-functional_genes <- load_functional_genes(INPUT_DIR)   # gene_type == "F" only
+functional_genes <- load_functional_genes(INPUT_DIR)   # functional only: "F" and "(F)"
 GERMLINE_CDR3    <- load_germline_cdr3(INPUT_DIR)      # gene -> germline CDR3 block
 vj_baseline_prior  <- list(A = extract_vj_marginal_prior("A", functional_genes),
                            B = extract_vj_marginal_prior("B", functional_genes))
