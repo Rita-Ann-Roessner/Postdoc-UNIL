@@ -38,7 +38,7 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- 0         # 0, 1, ..., N_STEPS, or "final"
+STEP            <- "final"         # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 2         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
@@ -131,7 +131,7 @@ CHAIN_WEIGHT <- "linear" # how TEMPO combines the two chains when scoring valida
 PLOT_EACH_STEP     <- TRUE   # if TRUE, plot MixTCRviz motif after each enrichment step
 VALIDATE_EACH_STEP <- TRUE  # if TRUE, run TEMPO validation after each enrichment step
 
-VALIDATION_AVAILABLE <- FALSE  # set FALSE when this epitope has NO validation data — skips ALL
+VALIDATION_AVAILABLE <- TRUE  # set FALSE when this epitope has NO validation data — skips ALL
                               # TEMPO validation (per-step AND final); motifs are still built and
                               # written. Manual flag on purpose (not auto file-detection), so a
                               # misplaced validation.csv can't silently pass unnoticed.
