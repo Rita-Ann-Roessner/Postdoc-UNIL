@@ -17,9 +17,9 @@
 # =============================================================================
 
 # ============================ CONFIG =========================================
-TCR_CSV      <- "/Users/roessner/Documents/PostDoc/Data/260626_ESMfold2_motif_builder/TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_NY-ESO-1_fix/LAU50.csv"                   # TCRs to score (6 gene/CDR3 cols)
-MOTIF_FILE   <- "/Users/roessner/Documents/PostDoc/Data/260626_ESMfold2_motif_builder/TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_NY-ESO-1_fix/A0201_SLLMWITQC/step2/motif_top_binders.csv"
-OUT_CSV      <- "/Users/roessner/Documents/PostDoc/Data/260626_ESMfold2_motif_builder/TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_NY-ESO-1_fix/LAU50_A0201_SLLMWITQC_model.csv"                            # NULL = "<TCR_CSV>_scored.csv"
+TCR_CSV      <- "/Users/roessner/Documents/PostDoc/Data/260626_ESMfold2_motif_builder/TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_NY-ESO-1_jointVJ/LAU50.csv"                   # TCRs to score (6 gene/CDR3 cols)
+MOTIF_FILE   <- "/Users/roessner/Documents/PostDoc/Data/260626_ESMfold2_motif_builder/TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_NY-ESO-1_jointVJ/A0201_SLLMWITQC/step2/motif_top_binders.csv"
+OUT_CSV      <- "/Users/roessner/Documents/PostDoc/Data/260626_ESMfold2_motif_builder/TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_NY-ESO-1_jointVJ/LAU50_A0201_SLLMWITQC_model.csv"                            # NULL = "<TCR_CSV>_scored.csv"
 CHAIN_WEIGHT <- "linear"                        # equal | sqrt | linear — MUST match the
                                                 # CHAIN_WEIGHT the motif was validated with
                                                 # in ESM_motif_builder.R (not read from it)

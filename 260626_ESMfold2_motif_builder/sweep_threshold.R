@@ -26,9 +26,25 @@
 source("ESM_motif_builder.R")   # helpers + config; main block skipped
 
 # ---- config -----------------------------------------------------------------
-BASE       <- "TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles"
+BASE       <- "TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_jointVJ"
 STEP_INDEX <- 1L          # which folded step to select from; NULL = highest folded
 THRESHOLDS <- c(0.55, 0.56, 0.60, 0.65, 0.70, 0.75, 0.80)
+
+# Epitopes to sweep. Set to NULL to inherit the `epitopes` of ESM_motif_builder.R,
+# which is usually NOT what you want here: BASE is an already folded tree and the
+# builder's list points at whatever run is being set up next.
+EPITOPES   <- c("A0201_ELAGIGILTV", "A0201_GILGFVFTL", "A0201_LLWNGPMAV")
+
+if (!is.null(EPITOPES)) epitopes <- EPITOPES
+have <- epitopes[dir.exists(file.path(BASE, epitopes))]
+if (length(have) == 0)
+  stop(sprintf("None of the requested epitopes exist under %s.\n  requested: %s\n  present:   %s",
+               BASE, paste(epitopes, collapse = ", "),
+               paste(list.dirs(BASE, recursive = FALSE, full.names = FALSE), collapse = ", ")))
+if (length(have) < length(epitopes))
+  warning(sprintf("Not in %s, skipped: %s", BASE,
+                  paste(setdiff(epitopes, have), collapse = ", ")))
+epitopes <- have
 
 SUMMARY_CSV <- file.path(BASE, sprintf("threshold_sweep_step%s.csv",
                                        if (is.null(STEP_INDEX)) "last" else STEP_INDEX))
