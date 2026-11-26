@@ -5,7 +5,15 @@ library(tidyr)
 library(pROC)
 
 # =============================================================================
-# ESM Motif Builder
+# ESM Motif Builder -- PER-COMBINATION (cell) V/J VARIANT
+#
+# Standalone copy of ESM_motif_builder.R. The ONLY differences from that file:
+#   * the PER-COMBINATION block in Configuration below
+#   * extract_vj_marginal_posterior()  also returns a per-combination posterior
+#   * sample_vj_pairs()                draws from it instead of from V x J
+#   * BASE_OUTPUT_DIR points at a separate tree (copy the step you enrich from
+#     into it by hand; step 0 depends on no posterior, so it can be reused)
+# Diff against ESM_motif_builder.R to see exactly that and nothing else.
 #
 # Structure-based iterative TCR motif building pipeline.
 # Uses ESMFold2 ipTM scoring with dummy partner chains.
@@ -42,7 +50,9 @@ STEP            <- "final"         # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 2         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_NY-ESO-1_fix" 
+# Separate tree, so the joint run cannot overwrite the factorized run's steps.
+# Copy the step you are enriching from (e.g. step0/) in here by hand first.
+BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_NY-ESO-1_jointVJ_new"
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
@@ -62,6 +72,80 @@ VJ_PRIOR_STRENGTH <- 60    # α: repertoire-prior pseudocount weight for the V/J
                            # since their absolute excess is necessarily small. LENGTH still uses
                            # the ratio form (LEN_WEIGHT_K) -- there the clipping was the binding
                            # problem, not the noise.
+# --- PER-COMBINATION (cell) V/J POSTERIOR ------------------------------------
+# This variant replaces the gene-level V/J posterior with one number per V/J
+# COMBINATION (one box in the V x J table), and samples from those directly.
+# There is no gene step in the sampling path at all.
+#
+# WHY. The stock posterior scores genes: TRAV17 is judged by its mean over the
+# 51 TRAJ it was paired with, so one excellent partner is averaged against fifty
+# mediocre ones. Measured on NY-ESO-1 step 0:
+#              best single combination     gene averaged over J
+#   TRAV17     rank 20 / 2267 (top 0.9%)   rank 26 / 45 (42nd pct)
+#   TRBV12-4   rank 39 /  598 (top 6.5%)   rank  7 / 46 (85th pct)
+# TRBV12-4 has a broad J-independent advantage and is promoted. TRAV17 has one
+# excellent combination and is not. An 80-fold panel confirmed TRAV17/TRAJ31 is
+# real, not the max of 51 noisy draws (length-stratified AUC 0.68, p = 0.013
+# Bonferroni; 3/40 TRAJ31 folds reach the step-0 score vs 0/40 controls).
+#
+# THE ESTIMATOR. Each combination c gets its own score, shrunk toward the
+# additive gene prediction by how little data it has:
+#
+#   s_add(c) = grand_mean + effect_V(v) + effect_J(j)      additive main effects
+#   s_hat(c) = (n_c * mean_score(c) + tau * s_add(c)) / (n_c + tau)
+#   P(c)     proportional to  P_base(c) * exp(beta * z(s_hat(c)))
+#
+# tau is NOT a knob: it is within-combination variance / between-combination
+# variance, estimated per chain per step from combinations with repeat folds.
+# NY-ESO-1 gave within 0.0176, between 0.0080, so tau = 2.2, i.e. one fold is
+# 31% its own evidence and 69% the gene prediction, eight folds is 78% its own.
+# Combinations never folded fall back entirely to s_add, which is always defined.
+# Sparsity therefore handles itself and no threshold is used anywhere.
+#
+# P_base IS REQUIRED. Dropping it (uniform over generable combinations) loses on
+# 12 of 12 comparisons across ELAGIGILTV / GILGFVFTL / LLWNGPMAV, median ratio
+# 1.54. It is the same prior the stock posterior already carries as
+# alpha * P_baseline(g) inside post(), just written multiplicatively.
+#
+# BETA is the concentration knob, the analogue of VJ_PRIOR_STRENGTH but acting
+# in the opposite direction and multiplicatively rather than additively. Two
+# consequences of the multiplicative form, both deliberate:
+#   - no max(0, .) clipping, so below-average combinations keep their ordering
+#     instead of collapsing onto the prior (the same reason LEN_WEIGHT_K uses a
+#     ratio rather than a count excess)
+#   - s_hat is a MEAN, so a combination's weight does not grow with how many
+#     times it has already been sampled. The count-excess runaway that takes
+#     TRAV12-2 to 42% of step 2 is structurally absent, not merely damped.
+#
+# EVIDENCE, and its limits. Scored by expected log-probability assigned to the
+# V/J combinations the validated positives actually use (a PROPER scoring rule;
+# an earlier mass-overlap metric was improper, rewarded concentration without
+# bound, and pointed the opposite way on every concentration question):
+#     cell beta=1        mean gain 0.467   median 0.642   better in 7 of 12
+#     gene alpha=120     mean gain 0.454   median 0.275   better in 6 of 12
+#     gene alpha=60      mean gain 0.385   median 0.366   (stock)
+#     cell beta=0.5      mean gain 0.373   median 0.453   better in 7 of 12
+#     cell beta=2        mean gain -0.041  median 0.340   better in 4 of 12
+# So beta has a genuine interior optimum near 1 and the direction is favourable,
+# but 7 of 12 is NOT significant (sign test p = 0.77). Treat this as unproven.
+# The one thing it reliably does is pull a strong combination out of a mediocre
+# gene: TRAV17/TRAJ31 moves from rank 456 to rank 83 of 2267.
+CELL_VJ          <- TRUE     # FALSE = fall back to the stock gene posterior
+CELL_VJ_BETA_MODE <- "match" # "match" = solve beta each step so the sampler
+                             #   spreads over the same effective number of
+                             #   combinations as the gene posterior would. Makes
+                             #   beta a calibration rather than a fit, so any
+                             #   difference is attributable to RANKING and not to
+                             #   concentration. This is the honest A/B setting.
+                             # "fixed" = use CELL_VJ_BETA.
+CELL_VJ_BETA     <- 1.0      # used when CELL_VJ_BETA_MODE = "fixed". Tune this
+                             # ONLY on held-out epitopes, never on one you report.
+CELL_VJ_TAU      <- NA       # NA = estimate per chain/step from repeat folds.
+                             # A number overrides it (NY-ESO-1 estimate: 2.2).
+CELL_VJ_MIN_REP  <- 5        # combinations with >=3 folds needed to estimate tau;
+                             # below this many such combinations, fall back to 2.2
+CELL_VJ_REPORT   <- 10       # top combinations to print per chain per step; 0 = quiet
+
 LEN_WEIGHT_K     <- 5      # pseudocount in the per-length enrichment weight
                            #   w(L) = (n_top(L) + k) / (n_all(L)*p_global + k)
                            # Pulls lengths with few observations toward neutral (w=1).
@@ -129,7 +213,7 @@ CHAIN_WEIGHT <- "linear" # how TEMPO combines the two chains when scoring valida
                         #            (aggressive; can over-penalise a real but minority chain).
 
 PLOT_EACH_STEP     <- TRUE   # if TRUE, plot MixTCRviz motif after each enrichment step
-VALIDATE_EACH_STEP <- TRUE  # if TRUE, run TEMPO validation after each enrichment step
+VALIDATE_EACH_STEP <- FALSE  # if TRUE, run TEMPO validation after each enrichment step
 
 VALIDATION_AVAILABLE <- TRUE  # set FALSE when this epitope has NO validation data — skips ALL
                               # TEMPO validation (per-step AND final); motifs are still built and
@@ -998,7 +1082,95 @@ extract_vj_marginal_posterior <- function(top_tcrs, scored, chain_letter, margin
   pv <- post(v_col, marginal_prior$V, decoy_bg$V)
   pj <- post(j_col, marginal_prior$J, decoy_bg$J)
   if (is.null(pv) || is.null(pj)) return(NULL)
-  list(V = pv, J = pj)
+  out <- list(V = pv, J = pj)
+
+  # --- PER-COMBINATION posterior (see the CELL_VJ block in Configuration) -----
+  # Everything above is the stock gene-level posterior, unchanged: it is kept
+  # because the "match" beta calibration needs its effective support as a target,
+  # and because CELL_VJ = FALSE must fall back to it exactly.
+  if (!isTRUE(CELL_VJ)) return(out)
+  if (!(SCORE_COL %in% colnames(scored))) return(out)
+
+  ok <- !is.na(scored[[v_col]]) & !is.na(scored[[j_col]]) & !is.na(scored[[SCORE_COL]])
+  if (sum(ok) < 20) return(out)
+  vv <- scored[[v_col]][ok]; jj <- scored[[j_col]][ok]; y <- scored[[SCORE_COL]][ok]
+  cell_obs <- paste(vv, jj, sep = "_")
+
+  # candidate combinations: a CDR3 baseline exists AND both genes are functional
+  keys <- names(cdr3_baseline[[paste0("TR", chain_letter)]])
+  sp   <- strsplit(keys, "_", fixed = TRUE)
+  vg   <- vapply(sp, `[`, character(1), 1)
+  jg   <- vapply(sp, `[`, character(1), 2)
+  keep <- vg %in% names(marginal_prior$V) & jg %in% names(marginal_prior$J)
+  if (!any(keep)) return(out)
+  keys <- keys[keep]; vg <- vg[keep]; jg <- jg[keep]
+
+  # additive main effects: the factorized model written in score space.
+  # Effects are deviations from the grand mean, so a gene absent from `scored`
+  # contributes 0, i.e. "behaves like the average gene", rather than inheriting
+  # some reference level.
+  gm   <- mean(y)
+  ev   <- tapply(y, vv, mean) - gm
+  ej   <- tapply(y, jj, mean) - gm
+  e_v  <- ifelse(vg %in% names(ev), as.numeric(ev[vg]), 0)
+  e_j  <- ifelse(jg %in% names(ej), as.numeric(ej[jg]), 0)
+  s_add <- gm + e_v + e_j
+
+  n_c <- table(cell_obs)
+  m_c <- tapply(y, cell_obs, mean)
+  nn  <- as.numeric(n_c[keys]); nn[is.na(nn)] <- 0
+  mm  <- as.numeric(m_c[keys]); mm[is.na(mm)] <- s_add[is.na(mm)]
+
+  # tau = within-combination variance / between-combination variance
+  tau <- CELL_VJ_TAU
+  if (is.na(tau)) {
+    rep_cells <- names(n_c)[n_c >= 3]
+    if (length(rep_cells) >= CELL_VJ_MIN_REP) {
+      v_w <- mean(tapply(y, cell_obs, stats::var)[rep_cells], na.rm = TRUE)
+      v_b <- max(stats::var(m_c[rep_cells], na.rm = TRUE) -
+                   v_w / mean(as.numeric(n_c[rep_cells])), 1e-6)
+      tau <- v_w / v_b
+    } else tau <- 2.2            # no repeats at this step (step 0 is a 1-fold grid)
+  }
+
+  s_hat <- (nn * mm + tau * s_add) / (nn + tau)
+  sdh   <- stats::sd(s_hat)
+  if (!is.finite(sdh) || sdh <= 0) return(out)
+  z <- (s_hat - mean(s_hat)) / sdh
+
+  p_base <- as.numeric(marginal_prior$V[vg]) * as.numeric(marginal_prior$J[jg])
+  p_base <- p_base / sum(p_base)
+
+  eff <- function(p) { p <- p[p > 0]; exp(-sum(p * log(p))) }
+  mk  <- function(b) { p <- p_base * exp(b * z); p / sum(p) }
+
+  beta <- CELL_VJ_BETA
+  if (identical(CELL_VJ_BETA_MODE, "match")) {
+    # target: the effective number of combinations the GENE posterior would use
+    pg <- as.numeric(pv[vg]) * as.numeric(pj[jg]); pg <- pg / sum(pg)
+    tg <- eff(pg)
+    beta <- tryCatch(stats::uniroot(function(b) eff(mk(b)) - tg,
+                                    c(1e-3, 30))$root,
+                     error = function(e) CELL_VJ_BETA)
+  }
+
+  p_cell <- mk(beta)
+  names(p_cell) <- keys
+
+  if (CELL_VJ_REPORT > 0) {
+    o <- order(-p_cell)[seq_len(min(CELL_VJ_REPORT, length(p_cell)))]
+    pg <- as.numeric(pv[vg]) * as.numeric(pj[jg]); pg <- pg / sum(pg)
+    message(sprintf("  [chain %s] per-combination posterior: tau=%.2f beta=%.2f (%s), %d combinations, eff %.0f (gene posterior eff %.0f)",
+                    chain_letter, tau, beta, CELL_VJ_BETA_MODE, length(p_cell),
+                    eff(p_cell), eff(pg)))
+    for (i in o)
+      message(sprintf("    %-24s n=%2.0f  mean=%.3f  s_add=%.3f  s_hat=%.3f  P=%.4f%%  (gene P=%.4f%%)",
+                      keys[i], nn[i], mm[i], s_add[i], s_hat[i],
+                      100 * p_cell[i], 100 * pg[i]))
+  }
+
+  out$cell <- p_cell
+  out
 }
 
 
@@ -1022,7 +1194,20 @@ sample_vj_pairs <- function(vj_dist, chain_letter, n_pairs, output_dir, cdr3_bas
     stop(sprintf("No valid functional V/J pairs with a CDR3 baseline for chain TR%s.", chain_letter))
   vg <- vg[ok]; jg <- jg[ok]
 
-  w   <- as.numeric(vj_dist$V[vg]) * as.numeric(vj_dist$J[jg])   # factorized weight per pair
+  # --- PER-COMBINATION: draw straight from the per-combination posterior.
+  # It is defined over exactly this key set, so no gene product is formed at all.
+  # Falls back to the stock V x J product whenever CELL_VJ is off or the
+  # posterior could not be built.
+  if (!is.null(vj_dist$cell)) {
+    w <- as.numeric(vj_dist$cell[paste(vg, jg, sep = "_")])
+    w[is.na(w)] <- 0
+  } else {
+    w <- as.numeric(vj_dist$V[vg]) * as.numeric(vj_dist$J[jg])
+  }
+
+  if (sum(w) <= 0)
+    stop(sprintf("All V/J pair weights are zero for chain TR%s.", chain_letter))
+
   idx <- sample(seq_along(w), size = n_pairs, replace = TRUE, prob = w / sum(w))
 
   pairs <- data.frame(vg[idx], jg[idx], stringsAsFactors = FALSE)
@@ -1579,6 +1764,10 @@ for (epitope in epitopes) {
   mhc_allele <- if (grepl("^HLA_", mhc)) mhc else paste0("HLA_", mhc)         # e.g. "HLA_A0201"
 
   message(sprintf("\n========== %s (STEP = %s) ==========", epitope, STEP))
+  message(sprintf("  CELL V/J: %s, beta mode %s (%.2f), tau %s",
+                  if (isTRUE(CELL_VJ)) "on" else "OFF (stock gene posterior)",
+                  CELL_VJ_BETA_MODE, CELL_VJ_BETA,
+                  if (is.na(CELL_VJ_TAU)) "estimated" else sprintf("%.2f", CELL_VJ_TAU)))
 
   if (identical(STEP, 0) || identical(STEP, 0L)) {
 

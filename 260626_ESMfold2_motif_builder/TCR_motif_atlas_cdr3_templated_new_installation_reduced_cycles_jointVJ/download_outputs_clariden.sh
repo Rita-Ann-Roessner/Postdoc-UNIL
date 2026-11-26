@@ -16,7 +16,7 @@ REMOTE_BASE=/iopsstor/scratch/cscs/rroessner/260626_ESMfold2_motif_builder/TCR_m
 
 # Which step's outputs to fetch. Pass the step number as the first arg
 # (e.g. ./download_outputs.sh 1); defaults to 1.
-step=step1
+step=step2
 
 # cd to the directory the script lives in (the local atlas root)
 cd "$(dirname "$0")"
