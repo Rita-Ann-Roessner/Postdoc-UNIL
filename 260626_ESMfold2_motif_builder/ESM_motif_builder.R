@@ -46,13 +46,13 @@ library(pROC)
 
 ### ---- Configuration --------------------------------------------------------
 
-STEP            <- "final"         # 0, 1, ..., N_STEPS, or "final"
+STEP            <- 1         # 0, 1, ..., N_STEPS, or "final"
 N_STEPS         <- 2         # total number of enrichment steps after step 0
 
 INPUT_DIR       <- "/Users/roessner/Documents/PostDoc/Data/MixTCRviz/data_raw/CDR123/HomoSapiens"
 # Separate tree, so the joint run cannot overwrite the factorized run's steps.
 # Copy the step you are enriching from (e.g. step0/) in here by hand first.
-BASE_OUTPUT_DIR <- "TCR_motif_atlas_cdr3_templated_new_installation_reduced_cycles_NY-ESO-1_jointVJ_new"
+BASE_OUTPUT_DIR <- "VJ_background_correction"
 SCORE_COL       <- "iptm_pair_mean"   # column in ESMFold output.txt; higher = better
 
 # Threshold schedule: one value per step 1..N_STEPS (TCRs with score >= threshold pass)
@@ -187,18 +187,45 @@ EXTENT_SOURCE <- "survival"
 # NULL = draw a fresh step-0 repertoire per epitope (the original behaviour).
 STEP0_PANEL <- "step0_panel"
 
-# Decoy V/J background correction (optional). When enabled, the null background in
-# the V/J excess is each gene's pass propensity against a DECOY (non-cognate)
-# epitope — the peptide-INDEPENDENT ESMFold fold artifact — instead of the flat
-# global pass rate. Passing above the decoy level counts as enrichment; germline
-# fold artifacts (e.g. TRAV12-2) stay at baseline, while genuinely epitope-specific
-# V/J (high cognate, low decoy) are still enriched. Recomputed on the fly at each
-# step's own selection threshold from the decoy step-0 fold.
-# Every gene present in the decoy fold uses its own rate, however few observations
-# back it; only genes absent from the decoy fall back to p_global.
-DECOY_CORRECTION_VJ  <- FALSE                       # correct the V/J excess null background
-DECOY_DIR        <- "step0_background"             # holds <decoy_label>/step0 folds
-DECOY_BY_MHC     <- c(A0201 = "A0201_ALAAAAAAV")   # MHC (allele w/o HLA_ prefix) -> decoy label
+# V/J FLOOR SCORE CORRECTION (replaces the old decoy V/J background correction).
+#
+# WHY THE DECOY VERSION WAS REMOVED. It estimated a per-gene pass propensity on a
+# poly-alanine decoy epitope and used it as the null in the V/J excess. Measured on
+# six cognate epitopes with validation data, the decoy REPRODUCES the bias it was
+# meant to remove (TRAV12-2 rank 1 of 45 on the decoy too), and subtracting it in
+# any scaling destroyed the epitope where TRAV12-2 is genuinely dominant. The
+# decoy still presents a real A2 platform, so the MHC-directed component of the
+# score is shared and survives subtraction.
+#
+# WHAT REPLACES IT. A fixed per-gene offset subtracted from the FOLD SCORE before
+# the threshold, so it changes which TCRs pass, not just how V/J are resampled.
+# For each gene, over a panel of background epitopes, take its share of the pass
+# set in each epitope and find the FLOOR, the smallest share across epitopes.
+# That floor is what the gene takes regardless of peptide. The offset is the score
+# shift that brings the floor epitope down to the uniform 1/n_genes baseline.
+# Genes whose floor is already at or below baseline get no offset at all (42 of 45
+# on alpha, 40 of 46 on beta).
+#
+# WHY CALIBRATING AT THE FLOOR IS SAFE. The penalty is sized at the gene's WORST
+# epitope, so whatever a gene earns above its own floor survives. Measured on the
+# six: TRAV12-2 loses 11.0 -> 7.7% at ELAGIGILTV (true share 77%) and 10.8 -> 9.7%
+# at LLWNGPMAV (true 62%), but 9.0 -> 5.3% at GILGFVFTL (true 5%). The epitope
+# contrast INCREASES, range ratio 1.2 -> 1.8, because removing a constant makes
+# the remaining differences relatively larger.
+#
+# GUARD. If an offset gene's share of the pass set still falls below baseline, its
+# offset is shrunk until it clears baseline again, so a gene can never be
+# eliminated by this correction. On the six background epitopes the guard never
+# fires on alpha at lambda 0.7 and fires on beta, which is expected: beta has ~120
+# passing folds per epitope, so baseline is ~2.6 folds and there is little room.
+#
+# The offset table is built from the background epitopes by make_vj_floor_offsets.R
+# and read from disk, so it is inspectable and does not change between runs.
+DECOY_CORRECTION_VJ <- TRUE                     # switch (name kept); now = floor score correction
+VJ_FLOOR_TABLE      <- "vj_floor_offsets.csv"   # chain,gene,delta[,floor_pct,floor_epitope,baseline_pct]
+VJ_FLOOR_LAMBDA     <- 0.7                      # fraction of each offset actually applied
+VJ_FLOOR_GUARD      <- TRUE                     # never push an offset gene below the 1/n baseline
+VJ_FLOOR_VERBOSE    <- TRUE
 
 FINAL_PERCENTILE <- 75  # final (STEP="final") top-binder cutoff = this percentile of the POOLED
                         # (alpha+beta) score distribution of the LAST step — i.e. keep the top
@@ -213,7 +240,7 @@ CHAIN_WEIGHT <- "linear" # how TEMPO combines the two chains when scoring valida
                         #            (aggressive; can over-penalise a real but minority chain).
 
 PLOT_EACH_STEP     <- TRUE   # if TRUE, plot MixTCRviz motif after each enrichment step
-VALIDATE_EACH_STEP <- FALSE  # if TRUE, run TEMPO validation after each enrichment step
+VALIDATE_EACH_STEP <- TRUE  # if TRUE, run TEMPO validation after each enrichment step
 
 VALIDATION_AVAILABLE <- TRUE  # set FALSE when this epitope has NO validation data — skips ALL
                               # TEMPO validation (per-step AND final); motifs are still built and
@@ -221,8 +248,10 @@ VALIDATION_AVAILABLE <- TRUE  # set FALSE when this epitope has NO validation da
                               # misplaced validation.csv can't silently pass unnoticed.
 
 EPITOPES_FILE <- NULL #"epitopes.txt"   # one "MHC_PEPTIDE" label per line, e.g. "A0201_ELAGIGILTV"
+epitopes <- c("A0201_ELAGIGILTV", "A0201_GILGFVFTL", "A0201_LLWNGPMAV", "A0201_GLCTLVAML", "A0201_NLVPMVATV", "A0201_YLQPRTFLL")
 #epitopes <- c("A0201_ELAGIGILTV", "A0201_GILGFVFTL", "A0201_LLWNGPMAV")
-epitopes <- c("A0201_SLLMWITQC")
+#epitopes <- c("A0201_SLLMWITQC")
+
 
 if (!is.null(EPITOPES_FILE) && file.exists(EPITOPES_FILE)) {
   epitopes <- trimws(readLines(EPITOPES_FILE))
@@ -918,7 +947,11 @@ load_esm_scores <- function(scores_file, model_file, score_col = SCORE_COL) {
   if (!"id" %in% colnames(scores) || !"id" %in% colnames(model))
     stop("Both the ESM scores file and model table must have an 'id'/'ID' column.")
 
-  merge(model, scores[, c("id", score_col)], by = "id")
+  out <- merge(model, scores[, c("id", score_col)], by = "id")
+  # V/J floor score correction, applied at the one place scores enter the
+  # pipeline so every consumer (thresholds, CELL_VJ posterior, sweeps) sees
+  # the same corrected value. Exact no-op when DECOY_CORRECTION_VJ is FALSE.
+  apply_vj_floor_correction(out, score_col = score_col)
 }
 
 
@@ -974,12 +1007,6 @@ extract_len_baseline_prior <- function(chain_letter) {
 }
 
 
-# Per-V and per-J DECOY pass propensity for one chain, pooled over the decoy step-0
-# replicates (DECOY_DIR/rep*/<decoy_label>/step0), computed at `threshold`. The
-# decoy is a non-cognate peptide, so this is the peptide-INDEPENDENT ESMFold fold
-# artifact per gene. `mhc` selects the decoy via DECOY_BY_MHC (HLA_ prefix
-# stripped). Returns list(V, J = pass-rate vectors; n_V, n_J = sample counts), or
-# NULL if no decoy is configured/folded for this MHC.
 # Step-0 fold directories holding one background label. Supports both layouts:
 #   <dir>/<label>/step0          single fold of the fixed step-0 panel (current)
 #   <dir>/rep<N>/<label>/step0   independent CDR3 replicates (legacy)
@@ -993,35 +1020,108 @@ background_step0_dirs <- function(dir, label) {
   cand[dir.exists(cand)]
 }
 
-load_decoy_background <- function(chain_letter, mhc, threshold,
-                                  decoy_dir = DECOY_DIR, decoy_by_mhc = DECOY_BY_MHC,
-                                  score_col = SCORE_COL) {
-  mhc_key <- sub("^HLA_", "", mhc)
-  if (!mhc_key %in% names(decoy_by_mhc)) return(NULL)
-  label      <- decoy_by_mhc[[mhc_key]]
+# ---------------------------------------------------------------------------
+# V/J FLOOR SCORE CORRECTION  (see the block in Configuration for the rationale)
+# ---------------------------------------------------------------------------
+
+# Read the per-gene offset table once and cache it. Columns: chain, gene, delta.
+# Returns a named numeric vector of deltas for one chain, or NULL.
+.vj_floor_cache <- new.env(parent = emptyenv())
+load_vj_floor_offsets <- function(chain_letter, table_file = VJ_FLOOR_TABLE) {
   chain_name <- if (chain_letter == "A") "alpha" else "beta"
-  v_col      <- paste0("TR", chain_letter, "V")
-  j_col      <- paste0("TR", chain_letter, "J")
-
-  frames <- list()
-  for (sd in background_step0_dirs(decoy_dir, label)) {
-    sf <- file.path(sd, sprintf("output_%s.csv", chain_name))
-    mf <- file.path(sd, sprintf("model_%s.csv",  chain_name))
-    if (file.exists(sf) && file.exists(mf))
-      frames[[length(frames) + 1]] <- load_esm_scores(sf, mf, score_col)[, c(v_col, j_col, score_col)]
+  key <- paste0(table_file, "|", chain_name)
+  if (!is.null(.vj_floor_cache[[key]])) return(.vj_floor_cache[[key]])
+  if (!file.exists(table_file)) {
+    warning(sprintf("DECOY_CORRECTION_VJ on but offset table not found: %s - no correction applied.",
+                    table_file))
+    return(NULL)
   }
-  if (length(frames) == 0) return(NULL)
+  d <- read.csv(table_file, stringsAsFactors = FALSE)
+  if (!all(c("chain", "gene", "delta") %in% names(d)))
+    stop("VJ_FLOOR_TABLE must have columns: chain, gene, delta. Got: ",
+         paste(names(d), collapse = ", "))
+  d <- d[d$chain == chain_name & !is.na(d$delta) & d$delta > 0, ]
+  out <- if (nrow(d) == 0) NULL else setNames(as.numeric(d$delta), d$gene)
+  .vj_floor_cache[[key]] <- out
+  out
+}
 
-  d    <- do.call(rbind, frames)                # pool all replicate decoy TCRs
-  pass <- d[[score_col]] >= threshold
-  rate_n <- function(key) {
-    keep <- !is.na(key)
-    a <- table(key[keep]); p <- table(key[keep & pass]); g <- names(a)
-    list(rate = setNames(as.numeric(ifelse(g %in% names(p), p[g], 0)) / as.numeric(a[g]), g),
-         n    = setNames(as.integer(a[g]), g))
+
+# Subtract lambda * delta(V gene) from the fold score of a scored table, and keep
+# the amount subtracted in `.vj_floor_offset` so the guard can give it back.
+# Chain is inferred from the columns. No table / switch off -> exact no-op.
+apply_vj_floor_correction <- function(scored, score_col = SCORE_COL,
+                                      lambda = VJ_FLOOR_LAMBDA) {
+  if (!isTRUE(DECOY_CORRECTION_VJ) || is.null(scored) || nrow(scored) == 0) return(scored)
+  if (!score_col %in% names(scored)) return(scored)
+  # Both model tables carry BOTH chains: the partner chain is a glycine dummy and
+  # its V gene is suffixed "_dummy". The real chain is the one that is not dummied,
+  # so presence of a TRAV/TRBV column is NOT enough to tell them apart.
+  real <- function(col) {
+    if (!col %in% names(scored)) return(FALSE)
+    v <- scored[[col]]; v <- v[!is.na(v)]
+    length(v) > 0 && mean(grepl("_dummy$", v)) < 0.5
   }
-  V <- rate_n(d[[v_col]]); J <- rate_n(d[[j_col]])
-  list(V = V$rate, n_V = V$n, J = J$rate, n_J = J$n)
+  chain_letter <- if (real("TRAV")) "A" else if (real("TRBV")) "B" else NA
+  if (is.na(chain_letter)) return(scored)
+  delta <- load_vj_floor_offsets(chain_letter)
+  if (is.null(delta) || !is.finite(lambda) || lambda <= 0) return(scored)
+
+  g   <- scored[[paste0("TR", chain_letter, "V")]]
+  off <- lambda * ifelse(!is.na(g) & g %in% names(delta), delta[g], 0)
+  off[is.na(off)] <- 0
+  scored[[".vj_floor_offset"]] <- as.numeric(off)
+  scored[[score_col]] <- scored[[score_col]] - as.numeric(off)
+  if (isTRUE(VJ_FLOOR_VERBOSE) && any(off > 0))
+    message(sprintf("  [floor] chain %s: offset %d/%d folds across %d genes (lambda=%.2f, max=%.3f)",
+                    chain_letter, sum(off > 0), nrow(scored),
+                    length(unique(g[off > 0])), lambda, max(off)))
+  scored
+}
+
+
+# Select rows at or above `threshold` from an already-corrected scored table.
+# Returns list(top = passing rows, scored = the full table with the scores the
+# selection actually used, so callers that also read `scored` stay consistent.
+# GUARD: if an offset gene ends up below the uniform 1/n_genes share of the pass
+# set, part of its offset is given back until it clears baseline, so the
+# correction can never eliminate a gene. Plain thresholding when the guard is off
+# or the table never touched this chain.
+select_top_floor <- function(scored, chain_letter, threshold, score_col = SCORE_COL) {
+  sc  <- scored[[score_col]]
+  keep_plain <- function()
+    list(top = scored[!is.na(sc) & sc >= threshold, , drop = FALSE], scored = scored)
+  if (!isTRUE(VJ_FLOOR_GUARD) || !".vj_floor_offset" %in% names(scored)) return(keep_plain())
+  off <- scored[[".vj_floor_offset"]]
+  if (!any(off > 0)) return(keep_plain())
+
+  gcol  <- paste0("TR", chain_letter, "V")
+  g     <- scored[[gcol]]
+  raw   <- sc + off                                  # uncorrected score
+  base  <- 1 / length(unique(g[!is.na(g)]))          # uniform share of the pass set
+  hits  <- unique(g[!is.na(g) & off > 0])
+  scale <- setNames(rep(1, length(hits)), hits)      # per-gene fraction of offset in force
+  fired <- character(0)
+
+  for (k in 1:12) {
+    s_cur <- raw - off * ifelse(!is.na(g) & g %in% names(scale), scale[g], 1)
+    sel   <- !is.na(s_cur) & s_cur >= threshold
+    n_sel <- sum(sel)
+    if (n_sel == 0) break
+    share <- vapply(hits, function(h) sum(sel & !is.na(g) & g == h) / n_sel, numeric(1))
+    bad   <- hits[share < base & scale[hits] > 1e-6]
+    if (length(bad) == 0) break
+    scale[bad] <- scale[bad] * 0.6
+    fired <- union(fired, bad)
+  }
+  if (length(fired) && isTRUE(VJ_FLOOR_VERBOSE))
+    message(sprintf("  [floor] guard eased: %s", paste(fired, collapse = ", ")))
+
+  eff   <- off * ifelse(!is.na(g) & g %in% names(scale), scale[g], 1)
+  s_cur <- raw - eff
+  scored[[score_col]]          <- s_cur
+  scored[[".vj_floor_offset"]] <- eff
+  list(top = scored[!is.na(s_cur) & s_cur >= threshold, , drop = FALSE], scored = scored)
 }
 
 
@@ -1030,13 +1130,12 @@ load_decoy_background <- function(chain_letter, mhc, threshold,
 # the marginal V and J effects (interaction ≈ 1), so V and J are modelled
 # INDEPENDENTLY. This credits enrichment to the gene that earned it and stops an
 # enriched V from dragging an unspecific "passenger" J along (and vice versa).
-# Per gene the null background is p_global (pooled pass rate) by default, OR -- when
-# a decoy background is supplied (decoy_bg from load_decoy_background) -- that gene's
-# own decoy pass propensity, so a peptide-independent fold artifact isn't credited
-# as enrichment:
-#   bg(g)        = decoy_bg(g)  if supplied, else p_global
-#   excess(g)    = max(0, n_top(g) - n_all(g)*bg(g))     [passers above the null]
+# The null background per gene is p_global, the pooled pass rate:
+#   excess(g)    = max(0, n_top(g) - n_all(g)*p_global)  [passers above the null]
 #   posterior(g) ∝ α*P_baseline(g) + excess(g)           [shrink toward the prior]
+# The peptide-independent germline fold artifact is NOT handled here. It is removed
+# upstream by the floor SCORE correction, before top_tcrs is formed, so by the time
+# this runs the artifact is already out of both n_top and the scores.
 #
 # Known costs of this form, measured at GIL step 1 -- kept deliberately, but do not
 # re-derive them from scratch:
@@ -1051,36 +1150,33 @@ load_decoy_background <- function(chain_letter, mhc, threshold,
 #    (13 genes) ~3.6x more shrinkage per gene than TRAV (45 genes).
 # A rate-ratio form fixed all three but was too noisy at the gene level; see
 # VJ_PRIOR_STRENGTH. Length still uses the ratio (extract_cdr3_len_weight).
-# decoy_bg = NULL falls back to p_global for every gene.
+# (the old decoy_bg argument is gone; see the VJ_FLOOR block in Configuration).
 # Restricted to functional genes (marginal_prior names). Returns list(V, J) or NULL.
 extract_vj_marginal_posterior <- function(top_tcrs, scored, chain_letter, marginal_prior,
-                                           alpha = VJ_PRIOR_STRENGTH, decoy_bg = NULL) {
+                                           alpha = VJ_PRIOR_STRENGTH) {
   v_col <- paste0("TR", chain_letter, "V")
   j_col <- paste0("TR", chain_letter, "J")
   if (!all(c(v_col, j_col) %in% colnames(top_tcrs))) return(NULL)
   if (nrow(scored) == 0) return(NULL)
   p_global <- nrow(top_tcrs) / nrow(scored)
 
-  post <- function(gene_col, prior, bg_p) {
+  post <- function(gene_col, prior) {
     n_top <- table(top_tcrs[[gene_col]][!is.na(top_tcrs[[gene_col]])])
     n_all <- table(scored[[gene_col]][!is.na(scored[[gene_col]])])
     genes <- names(prior)
     # counts and the per-gene null, shared by both modes
     nt_v <- vapply(genes, function(g) if (g %in% names(n_top)) as.numeric(n_top[[g]]) else 0, numeric(1))
     na_v <- vapply(genes, function(g) if (g %in% names(n_all)) as.numeric(n_all[[g]]) else 0, numeric(1))
-    # decoy pass propensity as the null; fall back to the pooled global rate
-    # only when no decoy background is supplied for this gene.
-    bg_v <- vapply(genes, function(g)
-      if (!is.null(bg_p) && g %in% names(bg_p)) as.numeric(bg_p[[g]]) else p_global, numeric(1))
-
-    excess    <- pmax(0, nt_v - na_v * bg_v)
+    # Null background is the pooled global pass rate. The germline fold artifact
+    # is handled upstream by the floor SCORE correction, not here.
+    excess    <- pmax(0, nt_v - na_v * p_global)
     posterior <- alpha * unlist(prior) + excess
     if (sum(posterior) == 0) return(NULL)
     posterior / sum(posterior)
   }
 
-  pv <- post(v_col, marginal_prior$V, decoy_bg$V)
-  pj <- post(j_col, marginal_prior$J, decoy_bg$J)
+  pv <- post(v_col, marginal_prior$V)
+  pj <- post(j_col, marginal_prior$J)
   if (is.null(pv) || is.null(pj)) return(NULL)
   out <- list(V = pv, J = pj)
 
@@ -1475,7 +1571,9 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
     stop(sprintf("[%s] Metadata table missing: %s\nExpected the frozen input_%s.csv (or model_%s.csv) matching the folded output.", label, model_file, chain_name, chain_name))
 
   scored   <- load_esm_scores(scores_file, model_file)
-  top_tcrs <- scored[scored[[SCORE_COL]] >= threshold, ]
+  sel      <- select_top_floor(scored, chain_letter, threshold)
+  top_tcrs <- sel$top
+  scored   <- sel$scored          # scores the selection actually used (guard applied)
   message(sprintf("  [chain %s] %d / %d TCRs with %s >= %.2f",
                   chain_letter, nrow(top_tcrs), nrow(scored), SCORE_COL, threshold))
 
@@ -1491,53 +1589,19 @@ enrich_one_chain <- function(chain_letter, step, label, peptide, mhc_allele, spe
     return(NULL)
   }
 
-  # Decoy V/J background at THIS step's threshold (peptide-independent fold
-  # artifact), loaded when DECOY_CORRECTION_VJ is on.
-  decoy_bg <- NULL
-  if (isTRUE(DECOY_CORRECTION_VJ)) {
-    decoy_bg <- load_decoy_background(chain_letter, mhc_allele, threshold)
-    if (is.null(decoy_bg))
-      warning(sprintf("[%s] DECOY_CORRECTION_VJ on but no decoy background found for MHC %s (chain %s) — using p_global.",
-                      label, mhc_allele, chain_letter))
-  }
-
   # (1) V/J distribution: factorized marginal enrichment (V and J independent),
   # each shrunk toward the functional-only marginal prior; pairs formed only from
   # combinations that have a CDR3 baseline. When DECOY_CORRECTION_VJ is on, the
-  # excess null background is each gene's decoy pass propensity instead of p_global.
+  # score correction has already been applied to `scored` and `top_tcrs`.
   vj_dist <- extract_vj_marginal_posterior(top_tcrs, scored, chain_letter,
                                            vj_baseline_prior[[chain_letter]],
-                                           alpha = VJ_PRIOR_STRENGTH, decoy_bg = decoy_bg)
+                                           alpha = VJ_PRIOR_STRENGTH)
   sample_vj_pairs(vj_dist, chain_letter, n_pairs, step_dir, cdr3_baseline)
 
-  # (1b) Carry the SAME correction into the length posterior and the PSSM.
-  # Without this, the decoy correction only reshapes which V/J get sampled while
-  # (2) and (3) are still estimated from the raw, artifact-contaminated top set.
-  # Per TCR the weight is the fraction of its gene's passes that are excess over
-  # that gene's decoy background -- the same quantity (1) uses, applied per row:
-  #     w(g) = max(0, n_top(g) - n_all(g)*bg(g)) / n_top(g)      in [0, 1]
-  # A gene passing exactly at its decoy rate contributes nothing; a gene with no
-  # decoy propensity keeps full weight. V and J weights multiply, matching the
-  # factorized treatment in (1). No decoy -> all weights 1 -> exact no-op.
+  # (1b) No per-TCR reweighting: the floor correction acts on the SCORE, so a
+  # gene's germline advantage is already gone by the time top_tcrs is formed.
+  # The old decoy weights are removed with the decoy background.
   tcr_weights <- rep(1, nrow(top_tcrs))
-  if (!is.null(decoy_bg)) {
-    p_global <- nrow(top_tcrs) / nrow(scored)
-    gene_w <- function(gt, bg_p) {
-      col   <- paste0("TR", chain_letter, gt)
-      n_all <- table(scored[[col]][!is.na(scored[[col]])])
-      n_top <- table(top_tcrs[[col]][!is.na(top_tcrs[[col]])])
-      vapply(top_tcrs[[col]], function(g) {
-        if (is.na(g) || !(g %in% names(n_top))) return(1)
-        nt <- as.numeric(n_top[[g]])
-        na <- if (g %in% names(n_all)) as.numeric(n_all[[g]]) else 0
-        bg <- if (!is.null(bg_p) && g %in% names(bg_p)) bg_p[[g]] else p_global
-        if (nt <= 0) 0 else min(1, max(0, (nt - na * bg) / nt))
-      }, numeric(1))
-    }
-    tcr_weights <- gene_w("V", decoy_bg$V) * gene_w("J", decoy_bg$J)
-    message(sprintf("  decoy weights (chain %s): mean=%.2f  zero-weight TCRs=%d/%d",
-                    chain_letter, mean(tcr_weights), sum(tcr_weights == 0), length(tcr_weights)))
-  }
 
   # (2) Per-length enrichment weight (ratio to the pool average; see
   # extract_cdr3_len_weight). Tilts each V/J pair's own length distribution.
@@ -1651,9 +1715,12 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
   # (100 - N)% best-scoring TCRs. Epitope-adaptive to the final pool.
   if (!is.null(final_percentile)) {
     last_scores <- unlist(lapply(c("alpha", "beta"), function(ch) {
-      f <- file.path(last_step_dir, sprintf("output_%s.csv", ch))
-      if (file.exists(f)) {
-        d <- read.csv(f, check.names = FALSE)
+      f  <- file.path(last_step_dir, sprintf("output_%s.csv", ch))
+      mf <- meta_csv(last_step_dir, ch)
+      # Use load_esm_scores so the pooled percentile is taken on the SAME
+      # (floor-corrected) scores the cut is then applied to.
+      if (file.exists(f) && file.exists(mf)) {
+        d <- load_esm_scores(f, mf)
         if (SCORE_COL %in% names(d)) d[[SCORE_COL]] else numeric(0)
       } else numeric(0)
     }))
@@ -1677,7 +1744,7 @@ run_final_validation <- function(label, peptide, mhc, mhc_allele,
       return(NULL)
     }
     scored   <- load_esm_scores(scores_file, model_file)
-    top_tcrs <- scored[scored[[SCORE_COL]] >= threshold, ]
+    top_tcrs <- select_top_floor(scored, chain_letter, threshold)$top
     message(sprintf("  [chain %s] %d / %d top binders", chain_letter, nrow(top_tcrs), nrow(scored)))
     write.csv(top_tcrs, file.path(last_step_dir, sprintf("top_tcrs_%s.csv", chain_name)),
               row.names = FALSE)
